@@ -26,11 +26,25 @@ if __name__ == '__main__':
     model = NetworkEngine(num_inputs=num_inputs, num_outputs=num_outputs,
                           params=params, architecture='L2MU')
 
-    trainer = Trainer(accelerator='gpu', devices=[2], max_epochs=300, num_sanity_val_steps=0, enable_progress_bar=True,
-                      enable_checkpointing=True,
-                      logger=TensorBoardLogger(save_dir="./tensorboard", name="l2mu", version="full-braille"),
-                      callbacks=[ModelCheckpoint(monitor='val_accuracy', mode='max', filename='best'),ModelCheckpoint(filename='last')]
-                      )
+    # trainer = Trainer(accelerator='gpu', devices=[2], max_epochs=300, num_sanity_val_steps=0, enable_progress_bar=True,
+    #                   enable_checkpointing=True,
+    #                   logger=TensorBoardLogger(save_dir="./tensorboard", name="l2mu", version="full-braille"),
+    #                   callbacks=[ModelCheckpoint(monitor='val_accuracy', mode='max', filename='best'),ModelCheckpoint(filename='last')]
+    #                   )
+
+    trainer = Trainer(
+    accelerator='gpu',
+    devices=1,
+    max_epochs=300,
+    num_sanity_val_steps=0,
+    enable_progress_bar=True,
+    enable_checkpointing=True,
+    logger=TensorBoardLogger(save_dir="./tensorboard", name="l2mu", version="full-braille"),
+    callbacks=[
+        ModelCheckpoint(monitor='val_accuracy', mode='max', filename='best'),
+        ModelCheckpoint(filename='last')
+    ]
+)
     
     # trainer = Trainer(accelerator='cpu', devices=1, max_epochs=300,
     #                     num_sanity_val_steps=0, enable_progress_bar=True,
