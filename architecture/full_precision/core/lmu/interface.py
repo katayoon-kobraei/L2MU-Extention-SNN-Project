@@ -24,6 +24,8 @@ class LMUCore(nn.Module):
 
         self.B = None
         self.A = None
+        self.C = None
+        self.D = None
 
         # Parameters passed
         self.input_size = input_size
@@ -69,9 +71,11 @@ class LMUCore(nn.Module):
         self.W_h = XavierLinear(self.hidden_size, self.hidden_size, bias=False)
         self.W_m = XavierLinear(self.memory_size * self.order, self.hidden_size, bias=False)
 
-        if self.output:
-            self.output_transformation = nn.Linear(self.hidden_size, self.output_size)
-
+        if self.output: # spk_memory:[batch, memory_size * order]   spk_u:[batch, memory_size] 
+            self.output_transformation = nn.Linear(self.memory_size, self.output_size)
+            self.C = CLinear(self.order, 1, bias=False)
+            self.D = CLinear(1, 1, bias=False)
+            self._gen_CD()
     @property
     def theta(self):
         if self.trainable_theta:
@@ -114,7 +118,49 @@ class LMUCore(nn.Module):
                 B = B.T / self._init_theta
 
             self.A.weight = nn.Parameter(A, requires_grad=False)
-            self.A.weight = nn.Parameter(B, requires_grad=False)
+            self.B.weight = nn.Parameter(B, requires_grad=False)
+
+
+    def _shifted_legendre(self, n, x):
+        """Shifted Legendre polynomial P_n*(x), x in [0,1]."""
+        if n == 0:
+            return 1.0
+        if n == 1:
+            return 2.0 * x - 1.0
+
+        p_nm1 = 1.0
+        p_n = 2.0 * x - 1.0
+        for k in range(1, n):
+            p_np1 = ((2 * k + 1) * (2 * x - 1) * p_n - k * p_nm1) / (k + 1)
+            p_nm1, p_n = p_n, p_np1
+        return p_n
+
+
+    def _gen_CD(self, theta_prime=None):
+        """
+        Generates fixed C and D matrices for the SSM output:
+            y[t] = C x[t] + D u[t]
+
+        theta_prime: delay to reconstruct inside the memory window.
+                    If None, defaults to full delay theta.
+        """
+        if theta_prime is None:
+            theta_prime = self._init_theta
+
+        alpha = float(theta_prime) / float(self._init_theta)  # in [0,1]
+
+        # C has one row: [P0(alpha), P1(alpha), ..., P_{order-1}(alpha)]
+        C = np.array(
+            [[self._shifted_legendre(i, alpha) for i in range(self.order)]],
+            dtype=np.float32
+        )  # shape (1, order)
+
+        # For the LDN formulation, D = 0
+        D = np.zeros((1, 1), dtype=np.float32)
+
+        self.C.weight = nn.Parameter(torch.tensor(C), requires_grad=False)
+        self.D.weight = nn.Parameter(torch.tensor(D), requires_grad=False)
+
 
     @staticmethod
     def _cont2discrete_zoh(A, B):

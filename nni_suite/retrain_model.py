@@ -31,6 +31,13 @@ if __name__ == '__main__':
                       logger=TensorBoardLogger(save_dir="./tensorboard", name="l2mu", version="full-braille"),
                       callbacks=[ModelCheckpoint(monitor='val_accuracy', mode='max', filename='best'),ModelCheckpoint(filename='last')]
                       )
+    
+    # trainer = Trainer(accelerator='cpu', devices=1, max_epochs=300,
+    #                     num_sanity_val_steps=0, enable_progress_bar=True,
+    #                     enable_checkpointing=True,
+    #                     logger=TensorBoardLogger(save_dir="./tensorboard", name="l2mu", version="full-braille"),
+    #                     callbacks=[ModelCheckpoint(monitor='val_accuracy', mode='max', filename='best'), ModelCheckpoint(filename='last')]
+    #                 )
     trainer.fit(model=model, datamodule=data_module)
     test_data = trainer.test(model=model, datamodule=data_module, verbose=False, ckpt_path='best')[0]
     test_accuracy = test_data['test_accuracy']

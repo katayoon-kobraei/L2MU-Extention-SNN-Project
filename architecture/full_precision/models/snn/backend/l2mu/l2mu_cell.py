@@ -28,7 +28,7 @@ class L2MUCell(LMUCore):
         except AttributeError:
             raise ValueError(f"The neuron type '{neuron_type}' does not exist in snntorch. Check the class name.")
 
-
+##### Flag: init_hidden = True?
         self.spk_u = Neuron(beta=params['beta_spk_u'], threshold=params['threshold_spk_u'], learn_beta=True, learn_threshold=True, init_hidden=True,)
         self.spk_h = Neuron(beta=params['beta_spk_h'], threshold=params['threshold_spk_h'],  learn_beta=True, learn_threshold=True, init_hidden=True)
         self.spk_m = Neuron(beta=params['beta_spk_m'], threshold=params['threshold_spk_m'], learn_beta=True, learn_threshold=True, init_hidden=True)
@@ -66,9 +66,10 @@ class L2MUCell(LMUCore):
 
         # Equation (4) of the paper
         spk_u = self.spk_u(curr_u)
+        spk_u_flat = spk_u
 
         # separate memory/order dimensions
-        spk_u = torch.unsqueeze(spk_u, -1)
+        spk_u = torch.unsqueeze(spk_u, -1)   # [B, memory_size, 1]
         spk_memory = torch.reshape(spk_memory, (-1, self.memory_size, self.order))
 
         curr_m = self.A(spk_memory) +  self.B(spk_u)
@@ -78,18 +79,22 @@ class L2MUCell(LMUCore):
 
         spk_memory = self.spk_m(curr_m)
 
-        # re-combine memory/order dimensions
-        spk_memory = torch.reshape(spk_memory, (-1, self.memory_size * self.order))
+            # Hidden-state path (kept unchanged if you still want L2MU internal dynamics)
+        spk_memory_flat = torch.reshape(
+            spk_memory, (-1, self.memory_size * self.order)
+        )                                              # [B, memory_size * order]
 
-        # Equation (6) of the paper
-        curr_h = self.W_x(spk_input) +  self.W_h(spk_hidden) + self.W_m(spk_memory)
+        curr_h = self.W_x(spk_input) + self.W_h(spk_hidden) + self.W_m(spk_memory_flat)
+        spk_hidden = self.spk_h(curr_h)                # [B, hidden_size]
 
-        spk_hidden = self.spk_h(curr_h)  # [batch_size, hidden_size]
-
-        # Output
+        # Core SSM output: y[t] = C x[t] + D u[t]
         if self.output:
-            curr_output = self.output_transformation(spk_hidden)
-            spk_output = self.spk_output(curr_output)
-            return spk_output, spk_hidden, spk_memory
+            y_ssm = self.C(spk_memory) + self.D(spk_u)   # [B, memory_size, 1]
+            y_ssm = y_ssm.squeeze(-1)                    # [B, memory_size]
 
-        return spk_hidden, spk_hidden, spk_memory
+            curr_output = self.output_transformation(y_ssm)
+
+            # Better to return logits directly for classification
+            return curr_output, spk_hidden, spk_memory_flat
+
+        return spk_hidden, spk_hidden, spk_memory_flat
