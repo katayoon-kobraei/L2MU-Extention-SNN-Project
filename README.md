@@ -1,22 +1,22 @@
-# LIF-based Legendre Memory Unit (L²MU)
+# Spiking SSM based on the L²MU implementation
 
-Official implementation of the paper:  
+The outline is from the official implementation of the paper  
 **_“A LIF-based Legendre Memory Unit as Neuromorphic State Space Model benchmarked on a second-long spatio-temporal task”_**  
 by *Benedetto Leto, Gianvito Urgese, Enrico Macii, and Vittorio Fra* — Politecnico di Torino
 
 ---
 
-## Abstract
+## **Target architecture overview**
 
-This repository hosts the implementation and experiments from the paper *"A LIF-based Legendre Memory Unit as Neuromorphic State Space Model benchmarked on a second-long spatio-temporal task"*.  
-The **L²MU** is a fully spiking reinterpretation of the **Legendre Memory Unit (LMU)**, where each core block—encoder, hidden state, and memory—is replaced by a **population of Leaky Integrate-and-Fire (LIF) neurons**.  
-All communications between these populations occur via **synaptic currents and spike trains**, leading to a neuromorphic **state-space model** capable of long-range temporal processing and energy-efficient computation.
+Below is a scheme of the architecture of the spiking SSM to be implemented starting from the L²MU design principles:
 
-Benchmarking on the **event-based Braille letter recognition task** shows that the L²MU **outperforms previous state-of-the-art recurrent SNNs**, achieving **85.6%** accuracy on the complete 27-class dataset and **97.1%** on a 7-class subset.
+<p align="center">
+  <img src="images/sSSM.png" alt="L2MU Architecture" width="700">
+</p>
 
 ---
 
-## Architecture Overview
+## L²MU overview
 
 The L²MU redesigns the original LMU’s mathematical formulation into a spike-driven system.
 
