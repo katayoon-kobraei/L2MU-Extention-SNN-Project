@@ -2,7 +2,7 @@ import torch
 from torch import nn
 import numpy as np
 from abc import abstractmethod
-from architecture.full_precision.core.lmu.utils import CLinear, XavierLinear
+from architecture.full_precision.core.lmu.utils import LCLinear, CLinear, XavierLinear
 
 
 class LMUCore(nn.Module):
@@ -70,6 +70,10 @@ class LMUCore(nn.Module):
 
         # W_out: trainable [output_size, memory_size]
         self.W_out = XavierLinear(self.memory_size, self.output_size, bias=False)
+
+        # e_x: input encoder [input_size -> memory_size]
+        # Projects spiking input to one scalar per memory slot (u(t) in LMU)
+        self.e_x = LCLinear(self.input_size, self.memory_size, bias=False)
 
     @property
     def theta(self):

@@ -103,12 +103,13 @@ class L2MUCell(LMUCore):
             )
 
         # ── m population ──────────────────────────────────────────────
-        # spk_input: [B, input_size] → unsqueeze → [B, input_size, 1]
-        # B(spk_input):  [B, memory_size, 1]   (broadcast over memory slots)
-        # A(spk_memory): [B, memory_size, order] → stays same shape
-        spk_input_3d = spk_input.unsqueeze(-1)          # [B, input_size, 1]
+        # B expects a scalar u(t) per memory slot: [B, memory_size, 1]
+        # Project spk_input [B, input_size] -> [B, memory_size] via e_x,
+        # then unsqueeze to [B, memory_size, 1].
+        u_t = self.e_x(spk_input)                        # [B, memory_size]
+        u_t_3d = u_t.unsqueeze(-1)                       # [B, memory_size, 1]
 
-        curr_m = self.A(spk_memory) + self.B(spk_input_3d)  # [B, memory_size, order]
+        curr_m = self.A(spk_memory) + self.B(u_t_3d)    # [B, memory_size, order]
 
         if self.discretizer == 'euler' and self.trainable_theta:
             curr_m = curr_m + curr_m * self.theta_inv
