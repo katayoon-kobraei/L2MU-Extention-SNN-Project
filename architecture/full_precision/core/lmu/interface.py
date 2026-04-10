@@ -2,80 +2,75 @@ import torch
 from torch import nn
 import numpy as np
 from abc import abstractmethod
-from architecture.full_precision.core.lmu.utils import LCLinear, CLinear, XavierLinear
+from architecture.full_precision.core.lmu.utils import CLinear, XavierLinear
+
 
 class LMUCore(nn.Module):
+    """
+    Pure SSM core implementing:
+        m[t+1] = A * m_spk[t] + B * x_spk[t]   (m population)
+        y[t]   = C * m_spk[t] + D * x_spk[t]   (y population)
+
+    A, B, C are fixed matrices derived from the LMU/LDN formulation.
+    D is a generic trainable weight matrix.
+
+    Removed from the original L2MU:
+        - e_x, e_h, e_m  (encoding vectors)
+        - W_x, W_h, W_m  (hidden-state kernels)
+        - hidden_size / hidden state entirely
+        - output_transformation linear layer
+    """
 
     def __init__(
             self,
             input_size,
-            hidden_size,
             memory_size,
             order,
             theta,
-            output_size=None,
-            output=False,
-            bias=False,
+            output_size,
             trainable_theta=False,
-            discretizer='zoh'
-
+            discretizer='zoh',
     ):
         super().__init__()
 
-        self.B = None
+        # Fixed SSM matrices
         self.A = None
+        self.B = None
         self.C = None
-        self.D = None
+        self.D = None   # trainable
+        self.W_out = None  # trainable
 
-        # Parameters passed
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.memory_size = memory_size
-        self.order = order
-        self._init_theta = theta
-        self.output_size = output_size
-        self.bias = bias
-        self.output = output
+        # Dimensions
+        self.input_size      = input_size
+        self.memory_size     = memory_size
+        self.order           = order
+        self._init_theta     = theta
+        self.output_size     = output_size
         self.trainable_theta = trainable_theta
-        self.discretizer = discretizer
-
-        # Parameters to be learned
-        self.W_h = None
-        self.W_m = None
-        self.W_x = None
-        self.bias_m = None
-        self.bias_h = None
-        self.bias_x = None
-        self.e_m = None
-        self.e_h = None
-        self.e_x = None
-        self.theta_inv = None
-        self.output_transformation = None
+        self.discretizer     = discretizer
 
     def init_parameters(self):
+
         if self.trainable_theta:
             self.theta_inv = nn.Parameter(torch.empty(()))
         else:
-            self.theta_inv = 1 / self._init_theta
+            self.theta_inv = 1.0 / self._init_theta
 
-        self.e_x = LCLinear(self.input_size, self.memory_size, bias=False)
-        self.e_h = LCLinear(self.hidden_size, self.memory_size, bias=False)
-        self.e_m = CLinear(self.memory_size * self.order, self.memory_size, bias=False)
-        # Kernels
-
+        # A and B: fixed, LMU-derived
         self.A = CLinear(self.order, self.order, bias=False)
         self.B = CLinear(1, self.order, bias=False)
         self._gen_AB()
 
-        self.W_x = XavierLinear(self.input_size, self.hidden_size, bias=False)
-        self.W_h = XavierLinear(self.hidden_size, self.hidden_size, bias=False)
-        self.W_m = XavierLinear(self.memory_size * self.order, self.hidden_size, bias=False)
+        # C: fixed, LDN Legendre projection [1, order]
+        self.C = CLinear(self.order, 1, bias=False)
+        self._gen_C()
 
-        if self.output: # spk_memory:[batch, memory_size * order]   spk_u:[batch, memory_size] 
-            self.output_transformation = nn.Linear(self.memory_size, self.output_size)
-            self.C = CLinear(self.order, 1, bias=False)
-            self.D = CLinear(1, 1, bias=False)
-            self._gen_CD()
+        # D: trainable [memory_size, input_size]
+        self.D = XavierLinear(self.input_size, self.memory_size, bias=False)
+
+        # W_out: trainable [output_size, memory_size]
+        self.W_out = XavierLinear(self.memory_size, self.output_size, bias=False)
+
     @property
     def theta(self):
         if self.trainable_theta:
@@ -83,18 +78,14 @@ class LMUCore(nn.Module):
         return self._init_theta
 
     def _gen_AB(self):
-        """Generates A and B matrices."""
-
-        # compute analog A/B matrices
+        """Generates fixed A and B matrices from the LMU formulation."""
         Q = np.arange(self.order, dtype=np.float64)
         R = (2 * Q + 1)[:, None]
         j, i = np.meshgrid(Q, Q)
         A = np.where(i < j, -1, (-1.0) ** (i - j + 1)) * R
         B = (-1.0) ** Q[:, None] * R
 
-        # discretize matrices
-        if self.discretizer == "zoh":
-            # save the un-discretized matrices for use in .call
+        if self.discretizer == 'zoh':
             _base_A = torch.FloatTensor(A.T)
             _base_B = torch.FloatTensor(B.T)
 
@@ -105,93 +96,77 @@ class LMUCore(nn.Module):
                 self._base_A = torch.tensor(0)
                 self._base_B = torch.tensor(0)
 
-            A, B = self._cont2discrete_zoh(
-                _base_A / self._init_theta, _base_B / self._init_theta
+            A_disc, B_disc = self._cont2discrete_zoh(
+                _base_A / self._init_theta,
+                _base_B / self._init_theta,
             )
+            self.A.weight = nn.Parameter(A_disc, requires_grad=False)
+            self.B.weight = nn.Parameter(B_disc, requires_grad=False)
 
-            self.A.weight = nn.Parameter(A, requires_grad=False)
-            self.B.weight = nn.Parameter(B, requires_grad=False)
-
-        else:
+        else:   # Euler
             if not self.trainable_theta:
                 A = A.T / self._init_theta + np.eye(self.order)
                 B = B.T / self._init_theta
-
-            self.A.weight = nn.Parameter(A, requires_grad=False)
-            self.B.weight = nn.Parameter(B, requires_grad=False)
-
+            self.A.weight = nn.Parameter(torch.FloatTensor(A), requires_grad=False)
+            self.B.weight = nn.Parameter(torch.FloatTensor(B), requires_grad=False)
 
     def _shifted_legendre(self, n, x):
-        """Shifted Legendre polynomial P_n*(x), x in [0,1]."""
+        """
+        Evaluates the n-th shifted Legendre polynomial P_n*(x) at x in [0,1].
+
+        Recurrence:
+            P_0*(x) = 1
+            P_1*(x) = 2x - 1
+            P_{k+1}*(x) = ((2k+1)(2x-1) P_k*(x) - k P_{k-1}*(x)) / (k+1)
+
+        The row vector [P_0*(alpha), ..., P_{d-1}*(alpha)] is the C matrix
+        that reconstructs u(t - theta') from m(t), where alpha = theta'/theta.
+        This matches Eq. 25 of the DeepLSNN supplementary (Eq. 3 of LMU paper).
+        """
         if n == 0:
             return 1.0
         if n == 1:
             return 2.0 * x - 1.0
-
-        p_nm1 = 1.0
-        p_n = 2.0 * x - 1.0
+        p_prev, p_curr = 1.0, 2.0 * x - 1.0
         for k in range(1, n):
-            p_np1 = ((2 * k + 1) * (2 * x - 1) * p_n - k * p_nm1) / (k + 1)
-            p_nm1, p_n = p_n, p_np1
-        return p_n
+            p_next = ((2 * k + 1) * (2 * x - 1) * p_curr - k * p_prev) / (k + 1)
+            p_prev, p_curr = p_curr, p_next
+        return p_curr
 
-
-    def _gen_CD(self, theta_prime=None):
+    def _gen_C(self, theta_prime=None):
         """
-        Generates fixed C and D matrices for the SSM output:
-            y[t] = C x[t] + D u[t]
+        Builds the fixed C matrix as a row of shifted Legendre polynomial values.
 
-        theta_prime: delay to reconstruct inside the memory window.
-                    If None, defaults to full delay theta.
+            C shape: [1, order]
+            C[0, i] = P_i*(alpha),  alpha = theta_prime / theta
+
+        alpha = 1  (default, full delay) means reconstructing the input at
+        the oldest point in the memory window — the standard LDN readout.
         """
         if theta_prime is None:
-            theta_prime = self._init_theta
+            theta_prime = self._init_theta   # full delay → alpha = 1
 
-        alpha = float(theta_prime) / float(self._init_theta)  # in [0,1]
+        alpha = float(theta_prime) / float(self._init_theta)   # in [0, 1]
 
-        # C has one row: [P0(alpha), P1(alpha), ..., P_{order-1}(alpha)]
         C = np.array(
             [[self._shifted_legendre(i, alpha) for i in range(self.order)]],
-            dtype=np.float32
-        )  # shape (1, order)
-
-        # For the LDN formulation, D = 0
-        D = np.zeros((1, 1), dtype=np.float32)
+            dtype=np.float32,
+        )   # shape [1, order]
 
         self.C.weight = nn.Parameter(torch.tensor(C), requires_grad=False)
-        self.D.weight = nn.Parameter(torch.tensor(D), requires_grad=False)
-
 
     @staticmethod
     def _cont2discrete_zoh(A, B):
-        """
-        Function to discretize A and B matrices using Zero Order Hold method.
+        """Discretise A and B using Zero-Order Hold (ZOH). Unchanged from original."""
+        em_upper = torch.concat([A, B], dim=0)
+        padding  = (0, B.shape[0], 0, 0)
+        em       = torch.nn.functional.pad(em_upper, padding)
+        ms       = torch.matrix_exp(em)
+        disc_A   = ms[: A.shape[0], : A.shape[1]]
+        disc_B   = ms[A.shape[0]:,  : A.shape[1]]
+        disc_B   = disc_B.reshape(disc_B.shape[1], disc_B.shape[0])
+        return disc_A, disc_B
 
-        Functionally equivalent to
-        ``scipy.signal.cont2discrete((A.T, B.T, _, _), method="zoh", dt=1.0)``
-        (but implemented in Pytorch so that it is differentiable).
-
-        Note that this accepts and returns matrices that are transposed from the
-        standard linear system implementation (as that makes it easier to use in
-        `.call`).
-        """
-
-        # combine A/B and pad to make square matrix
-        em_upper = torch.concat([A, B], dim=0)  # pylint: disable=no-value-for-parameter
-        padding = (0, B.shape[0], 0, 0)
-        em = torch.nn.functional.pad(em_upper, padding)
-
-        # compute matrix exponential
-        ms = torch.matrix_exp(em)
-
-        # slice A/B back out of combined matrix
-        discreet_A = ms[: A.shape[0], : A.shape[1]]
-        discreet_B = ms[A.shape[0]:, : A.shape[1]]
-        discreet_B = discreet_B.reshape(discreet_B.shape[1], discreet_B.shape[0])
-
-        return discreet_A, discreet_B
-
-    @classmethod
     @abstractmethod
-    def forward(self, input_, _h, _m):
+    def forward(self, spk_input, spk_memory):
         pass

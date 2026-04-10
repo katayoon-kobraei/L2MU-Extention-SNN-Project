@@ -15,29 +15,9 @@
     "_type": "quniform",
     "_value": [1, 20, 1]
   },
-  "hidden_size": {
-    "_type": "quniform",
-    "_value": [10, 300, 10]
-  },
   "memory_size": {
     "_type": "quniform",
     "_value": [10, 300, 10]
-  },
-  "beta_spk_u": {
-    "_type": "quniform",
-    "_value": [0.05, 1, 0.05]
-  },
-  "threshold_spk_u": {
-    "_type": "quniform",
-    "_value": [0.05, 1, 0.05]
-  },
-  "beta_spk_h": {
-    "_type": "quniform",
-    "_value": [0.05, 1, 0.05]
-  },
-  "threshold_spk_h": {
-    "_type": "quniform",
-    "_value": [0.05, 1, 0.05]
   },
   "beta_spk_m": {
     "_type": "quniform",
@@ -47,11 +27,19 @@
     "_type": "quniform",
     "_value": [0.05, 1, 0.05]
   },
-  "beta_spk_output": {
+  "beta_spk_y": {
     "_type": "quniform",
     "_value": [0.05, 1, 0.05]
   },
-  "threshold_spk_output": {
+  "threshold_spk_y": {
+    "_type": "quniform",
+    "_value": [0.05, 1, 0.05]
+  },
+  "beta_spk_out": {
+    "_type": "quniform",
+    "_value": [0.05, 1, 0.05]
+  },
+  "threshold_spk_out": {
     "_type": "quniform",
     "_value": [0.05, 1, 0.05]
   }
