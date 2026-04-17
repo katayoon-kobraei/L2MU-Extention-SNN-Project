@@ -47,7 +47,7 @@ if __name__ == '__main__':
     trainer = Trainer(
     accelerator='gpu',
     devices=1,
-    max_epochs=150,
+    max_epochs=50,
     num_sanity_val_steps=0,
     enable_progress_bar=True,
     enable_checkpointing=True,

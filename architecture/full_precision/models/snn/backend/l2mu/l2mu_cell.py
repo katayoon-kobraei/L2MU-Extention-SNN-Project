@@ -1,28 +1,26 @@
 import snntorch
 import torch
+import torch.nn as nn
 from architecture.full_precision.core.lmu.interface import LMUCore
 
 
 class L2MUCell(LMUCore):
     """
-    Parameters removed vs original L2MU:
-        - hidden_size, e_x, e_h, e_m, W_x, W_h, W_m, spk_u, spk_h
-    Parameters kept/added:
-        - A, B  (fixed, LMU)
-        - C     (fixed, LDN Legendre projection)
-        - D     (trainable, generic weight matrix)
-        - W_out (trainable)
-        - spk_m, spk_y, spk_out  (three LIF populations)
+    Three-population SSM cell with STDP for D and W_out.
+
+    Key design: STDP updates are NOT inside forward().
+    Instead, forward() just saves the spike history,
+    and stdp_update() is called separately after backward().
+    This avoids any conflict with PyTorch autograd.
     """
 
-    def __init__(
-            self,
-            input_size,
-            output_size,
-            params,
-            trainable_theta=False,
-            neuron_type='Leaky',
-    ):
+    STDP_A_PLUS   = 0.01
+    STDP_A_MINUS  = 0.01
+    STDP_TAU_PRE  = 0.95
+    STDP_TAU_POST = 0.95
+
+    def __init__(self, input_size, output_size, params,
+                 trainable_theta=False, neuron_type='Leaky'):
         super().__init__(
             input_size=input_size,
             memory_size=int(params['memory_size']),
@@ -32,100 +30,126 @@ class L2MUCell(LMUCore):
             trainable_theta=trainable_theta,
             discretizer=params.get('discretizer', 'zoh'),
         )
+        self.init_parameters()
 
-        self.init_parameters()   # builds A, B, C (fixed) + D, W_out (trainable)
+        # D and W_out trained by STDP only — excluded from Adam
+        self.D.weight.requires_grad_(False)
+        self.W_out.weight.requires_grad_(False)
 
         try:
             Neuron = getattr(snntorch, neuron_type)
         except AttributeError:
-            raise ValueError(
-                f"Neuron type '{neuron_type}' not found in snntorch."
-            )
+            raise ValueError(f"Neuron type '{neuron_type}' not found in snntorch.")
 
-        # m population — one LIF neuron per (memory_size × order) state element
-        self.spk_m = Neuron(
-            beta=params['beta_spk_m'],
-            threshold=params['threshold_spk_m'],
-            learn_beta=True,
-            learn_threshold=True,
-            init_hidden=True,
-        )
+        self.spk_m = Neuron(beta=params['beta_spk_m'], threshold=params['threshold_spk_m'],
+                            learn_beta=True, learn_threshold=True, init_hidden=True)
+        self.spk_y = Neuron(beta=params['beta_spk_y'], threshold=params['threshold_spk_y'],
+                            learn_beta=True, learn_threshold=True, init_hidden=True)
+        self.spk_out = Neuron(beta=params['beta_spk_out'], threshold=params['threshold_spk_out'],
+                              learn_beta=True, learn_threshold=True, init_hidden=True)
 
-        # y population — one LIF neuron per memory slot
-        self.spk_y = Neuron(
-            beta=params['beta_spk_y'],
-            threshold=params['threshold_spk_y'],
-            learn_beta=True,
-            learn_threshold=True,
-            init_hidden=True,
-        )
+        # STDP traces
+        self.trace_pre_D     = None
+        self.trace_post_D    = None
+        self.trace_pre_Wout  = None
+        self.trace_post_Wout = None
 
-        # out population — one LIF neuron per output class
-        self.spk_out = Neuron(
-            beta=params['beta_spk_out'],
-            threshold=params['threshold_spk_out'],
-            learn_beta=True,
-            learn_threshold=True,
-            init_hidden=True,
-        )
+        # Spike history for STDP — saved during forward, used in stdp_update()
+        self._spk_input_hist = []
+        self._spk_y_hist     = []
+        self._spk_out_hist   = []
 
-    # ------------------------------------------------------------------
     def init_cell(self):
-        """Reset all LIF membrane potentials and return empty state."""
         self.spk_m.init_leaky()
         self.spk_y.init_leaky()
         self.spk_out.init_leaky()
-        # spk_memory starts as empty — zeros are created on first forward
-        return torch.empty(0)   # spk_memory placeholder
+        self.trace_pre_D     = None
+        self.trace_post_D    = None
+        self.trace_pre_Wout  = None
+        self.trace_post_Wout = None
+        self._spk_input_hist = []
+        self._spk_y_hist     = []
+        self._spk_out_hist   = []
+        return torch.empty(0)
 
-    # ------------------------------------------------------------------
+    def _init_traces(self, batch_size, device):
+        self.trace_pre_D     = torch.zeros(batch_size, self.input_size,  device=device)
+        self.trace_post_D    = torch.zeros(batch_size, self.memory_size, device=device)
+        self.trace_pre_Wout  = torch.zeros(batch_size, self.memory_size, device=device)
+        self.trace_post_Wout = torch.zeros(batch_size, self.output_size, device=device)
+
     def forward(self, spk_input: torch.Tensor, spk_memory: torch.Tensor):
         """
-        One time-step forward pass.
-
-        Args:
-            spk_input  : binary spikes from the input layer [B, input_size]
-            spk_memory : previous memory spikes  [B, memory_size, order]
-                         (empty tensor on the very first step)
-
-        Returns:
-            spk_out    : output spikes for loss computation [B, output_size]
-            spk_memory : updated memory spikes [B, memory_size, order]
+        Forward pass — clean, no in-place weight modifications.
+        Spike history is saved for STDP which runs separately after backward().
         """
         batch_size = spk_input.shape[0]
+        device     = spk_input.device
 
-        # Initialise memory state to zeros on first call
         if spk_memory.numel() == 0:
             spk_memory = torch.zeros(
                 (batch_size, self.memory_size, self.order),
-                dtype=torch.float,
-                device=spk_input.device,
-            )
+                dtype=torch.float, device=device)
 
-        # ── m population ──────────────────────────────────────────────
-        # B expects a scalar u(t) per memory slot: [B, memory_size, 1]
-        # Project spk_input [B, input_size] -> [B, memory_size] via e_x,
-        # then unsqueeze to [B, memory_size, 1].
-        u_t = self.e_x(spk_input)                        # [B, memory_size]
-        u_t_3d = u_t.unsqueeze(-1)                       # [B, memory_size, 1]
+        if self.trace_pre_D is None:
+            self._init_traces(batch_size, device)
 
-        curr_m = self.A(spk_memory) + self.B(u_t_3d)    # [B, memory_size, order]
-
+        # m population
+        u_t    = self.e_x(spk_input)
+        u_t_3d = u_t.unsqueeze(-1)
+        curr_m = self.A(spk_memory) + self.B(u_t_3d)
         if self.discretizer == 'euler' and self.trainable_theta:
             curr_m = curr_m + curr_m * self.theta_inv
+        spk_memory = self.spk_m(curr_m)
 
-        spk_memory = self.spk_m(curr_m)                 # [B, memory_size, order]
-
-        # ── y population ──────────────────────────────────────────────
-        # C(spk_memory): [B, memory_size, 1]  — Legendre projection per slot
-        # D(spk_input):  [B, memory_size]     — trainable direct input path
+        # y population
         curr_y = self.C(spk_memory).squeeze(-1) + self.D(spk_input)
-        #           [B, memory_size]                 [B, memory_size]
+        spk_y  = self.spk_y(curr_y)
 
-        spk_y = self.spk_y(curr_y)                      # [B, memory_size]
+        # out population
+        curr_out = self.W_out(spk_y)
+        spk_out  = self.spk_out(curr_out)
 
-        # ── out population ────────────────────────────────────────────
-        curr_out = self.W_out(spk_y)                    # [B, output_size]
-        spk_out  = self.spk_out(curr_out)               # [B, output_size]
+        # Save spikes for STDP (detached — no gradient needed for STDP)
+        if self.training:
+            self._spk_input_hist.append(spk_input.detach())
+            self._spk_y_hist.append(spk_y.detach())
+            self._spk_out_hist.append(spk_out.detach())
 
         return spk_out, spk_memory
+
+    def stdp_update(self):
+        """
+        Apply STDP to D and W_out using the spike history saved during forward().
+        Call this AFTER loss.backward() and optimizer.step() to avoid any
+        conflict with the autograd graph.
+        """
+        if not self._spk_input_hist:
+            return  # nothing to update (e.g. during val/test)
+
+        with torch.no_grad():
+            for spk_input, spk_y, spk_out in zip(
+                self._spk_input_hist,
+                self._spk_y_hist,
+                self._spk_out_hist
+            ):
+                # --- STDP for D (pre=spk_input, post=spk_y) ---
+                self.trace_pre_D  = self.STDP_TAU_PRE  * self.trace_pre_D  + spk_input
+                self.trace_post_D = self.STDP_TAU_POST * self.trace_post_D + spk_y
+
+                dW_plus  = self.STDP_A_PLUS  * torch.einsum('bi,bj->ij', spk_y,   self.trace_pre_D)  / spk_input.shape[0]
+                dW_minus = self.STDP_A_MINUS * torch.einsum('bi,bj->ij', self.trace_post_D, spk_input) / spk_input.shape[0]
+                self.D.weight.add_(dW_plus - dW_minus)
+
+                # --- STDP for W_out (pre=spk_y, post=spk_out) ---
+                self.trace_pre_Wout  = self.STDP_TAU_PRE  * self.trace_pre_Wout  + spk_y
+                self.trace_post_Wout = self.STDP_TAU_POST * self.trace_post_Wout + spk_out
+
+                dW_plus  = self.STDP_A_PLUS  * torch.einsum('bi,bj->ij', spk_out, self.trace_pre_Wout)  / spk_y.shape[0]
+                dW_minus = self.STDP_A_MINUS * torch.einsum('bi,bj->ij', self.trace_post_Wout, spk_y)   / spk_y.shape[0]
+                self.W_out.weight.add_(dW_plus - dW_minus)
+
+        # Clear history for next batch
+        self._spk_input_hist = []
+        self._spk_y_hist     = []
+        self._spk_out_hist   = []
