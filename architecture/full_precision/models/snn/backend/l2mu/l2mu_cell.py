@@ -32,9 +32,10 @@ class L2MUCell(LMUCore):
         )
         self.init_parameters()
 
-        # D and W_out trained by STDP only — excluded from Adam
+        # D trained by STDP only — excluded from Adam
+        # W_out trained by backprop — needs gradient path to the loss
         self.D.weight.requires_grad_(False)
-        self.W_out.weight.requires_grad_(False)
+        self.W_out.weight.requires_grad_(True)   # backprop
 
         try:
             Neuron = getattr(snntorch, neuron_type)
@@ -48,35 +49,27 @@ class L2MUCell(LMUCore):
         self.spk_out = Neuron(beta=params['beta_spk_out'], threshold=params['threshold_spk_out'],
                               learn_beta=True, learn_threshold=True, init_hidden=True)
 
-        # STDP traces
-        self.trace_pre_D     = None
-        self.trace_post_D    = None
-        self.trace_pre_Wout  = None
-        self.trace_post_Wout = None
+        # STDP traces for D only
+        self.trace_pre_D  = None
+        self.trace_post_D = None
 
         # Spike history for STDP — saved during forward, used in stdp_update()
         self._spk_input_hist = []
         self._spk_y_hist     = []
-        self._spk_out_hist   = []
 
     def init_cell(self):
         self.spk_m.init_leaky()
         self.spk_y.init_leaky()
         self.spk_out.init_leaky()
-        self.trace_pre_D     = None
-        self.trace_post_D    = None
-        self.trace_pre_Wout  = None
-        self.trace_post_Wout = None
+        self.trace_pre_D  = None
+        self.trace_post_D = None
         self._spk_input_hist = []
         self._spk_y_hist     = []
-        self._spk_out_hist   = []
         return torch.empty(0)
 
     def _init_traces(self, batch_size, device):
-        self.trace_pre_D     = torch.zeros(batch_size, self.input_size,  device=device)
-        self.trace_post_D    = torch.zeros(batch_size, self.memory_size, device=device)
-        self.trace_pre_Wout  = torch.zeros(batch_size, self.memory_size, device=device)
-        self.trace_post_Wout = torch.zeros(batch_size, self.output_size, device=device)
+        self.trace_pre_D  = torch.zeros(batch_size, self.input_size,  device=device)
+        self.trace_post_D = torch.zeros(batch_size, self.memory_size, device=device)
 
     def forward(self, spk_input: torch.Tensor, spk_memory: torch.Tensor):
         """
@@ -110,44 +103,34 @@ class L2MUCell(LMUCore):
         curr_out = self.W_out(spk_y)
         spk_out  = self.spk_out(curr_out)
 
-        # Save spikes for STDP (detached — no gradient needed for STDP)
+        # Save spikes for STDP on D (detached — no gradient needed)
         if self.training:
             self._spk_input_hist.append(spk_input.detach())
             self._spk_y_hist.append(spk_y.detach())
-            self._spk_out_hist.append(spk_out.detach())
 
         return spk_out, spk_memory
 
     def stdp_update(self):
         """
-        Apply STDP to D and W_out using the spike history saved during forward().
-        Call this AFTER loss.backward() and optimizer.step() to avoid any
-        conflict with the autograd graph.
+        Apply STDP to D only using the spike history saved during forward().
+        W_out is now trained by backprop instead — it needs a gradient path to the loss.
+        Call this AFTER loss.backward() and optimizer.step().
         """
         if not self._spk_input_hist:
             return  # nothing to update (e.g. during val/test)
 
         with torch.no_grad():
-            for spk_input, spk_y, spk_out in zip(
+            for spk_input, spk_y in zip(
                 self._spk_input_hist,
                 self._spk_y_hist,
-                self._spk_out_hist
             ):
-                # --- STDP for D (pre=spk_input, post=spk_y) ---
+                # --- STDP for D only (pre=spk_input, post=spk_y) ---
                 self.trace_pre_D  = self.STDP_TAU_PRE  * self.trace_pre_D  + spk_input
                 self.trace_post_D = self.STDP_TAU_POST * self.trace_post_D + spk_y
 
-                dW_plus  = self.STDP_A_PLUS  * torch.einsum('bi,bj->ij', spk_y,   self.trace_pre_D)  / spk_input.shape[0]
+                dW_plus  = self.STDP_A_PLUS  * torch.einsum('bi,bj->ij', spk_y, self.trace_pre_D)    / spk_input.shape[0]
                 dW_minus = self.STDP_A_MINUS * torch.einsum('bi,bj->ij', self.trace_post_D, spk_input) / spk_input.shape[0]
                 self.D.weight.add_(dW_plus - dW_minus)
-
-                # --- STDP for W_out (pre=spk_y, post=spk_out) ---
-                self.trace_pre_Wout  = self.STDP_TAU_PRE  * self.trace_pre_Wout  + spk_y
-                self.trace_post_Wout = self.STDP_TAU_POST * self.trace_post_Wout + spk_out
-
-                dW_plus  = self.STDP_A_PLUS  * torch.einsum('bi,bj->ij', spk_out, self.trace_pre_Wout)  / spk_y.shape[0]
-                dW_minus = self.STDP_A_MINUS * torch.einsum('bi,bj->ij', self.trace_post_Wout, spk_y)   / spk_y.shape[0]
-                self.W_out.weight.add_(dW_plus - dW_minus)
 
         # Clear history for next batch
         self._spk_input_hist = []
