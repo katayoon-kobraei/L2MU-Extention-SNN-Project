@@ -1,71 +1,110 @@
 import snntorch
 import torch
-import torch.nn as nn
 from architecture.full_precision.core.lmu.interface import LMUCore
 
 
 class L2MUCell(LMUCore):
     """
-    Three-population SSM cell with STDP for D and W_out.
+    Experiment 1: SSM core with ONLY m and y populations.
+    No out population, no W_out, no classification.
 
-    Key design: STDP updates are NOT inside forward().
-    Instead, forward() just saves the spike history,
-    and stdp_update() is called separately after backward().
-    This avoids any conflict with PyTorch autograd.
+    Goal: train D with unsupervised STDP so that the y population
+    learns to represent prototypical Braille letter patterns,
+    purely from spike correlations — no labels used at all.
+
+    Architecture:
+        m population: m[t+1] = A * m[t] + B * x[t]   (A, B fixed)
+        y population: y[t]   = C * m[t] + D * x[t]   (C fixed, D STDP)
+
+    Fixes vs previous version:
+        1. Removed e_x — B now receives spk_input directly summed
+           to one scalar per memory slot, no random projection
+        2. STDP traces reset between EVERY sample (not just per batch)
+           following Diehl & Cook 2015 rest phase between samples
+        3. Weight-dependent STDP update — weights near W_MAX get
+           smaller potentiation, weights near W_MIN get smaller
+           depression — creates natural stabilization
     """
 
-    STDP_A_PLUS   = 0.01
-    STDP_A_MINUS  = 0.01
+    STDP_A_PLUS   = 0.02
+    STDP_A_MINUS  = 0.02
     STDP_TAU_PRE  = 0.95
     STDP_TAU_POST = 0.95
 
-    def __init__(self, input_size, output_size, params,
+    W_MAX = 1.0
+    W_MIN = 0.0
+
+    def __init__(self, input_size, params,
                  trainable_theta=False, neuron_type='Leaky'):
         super().__init__(
             input_size=input_size,
             memory_size=int(params['memory_size']),
             order=int(params['order']),
             theta=params['theta'],
-            output_size=output_size,
+            output_size=1,        # dummy — not used in exp1
             trainable_theta=trainable_theta,
             discretizer=params.get('discretizer', 'zoh'),
         )
         self.init_parameters()
 
-        # D trained by STDP only — excluded from Adam
-        # W_out trained by backprop — needs gradient path to the loss
+        # D trained by STDP only — excluded from any optimizer
         self.D.weight.requires_grad_(False)
-        self.W_out.weight.requires_grad_(True)   # backprop
+
+        # W_out not needed in Exp1
+        self.W_out.weight.requires_grad_(False)
+
+        # e_x is NOT used in Exp1 — B receives input directly
+        # We freeze it so it does not interfere
+        self.e_x.weight.requires_grad_(False)
 
         try:
             Neuron = getattr(snntorch, neuron_type)
         except AttributeError:
             raise ValueError(f"Neuron type '{neuron_type}' not found in snntorch.")
 
-        self.spk_m = Neuron(beta=params['beta_spk_m'], threshold=params['threshold_spk_m'],
-                            learn_beta=True, learn_threshold=True, init_hidden=True)
-        self.spk_y = Neuron(beta=params['beta_spk_y'], threshold=params['threshold_spk_y'],
-                            learn_beta=True, learn_threshold=True, init_hidden=True)
-        self.spk_out = Neuron(beta=params['beta_spk_out'], threshold=params['threshold_spk_out'],
-                              learn_beta=True, learn_threshold=True, init_hidden=True)
+        # m population
+        self.spk_m = Neuron(
+            beta=params['beta_spk_m'],
+            threshold=params['threshold_spk_m'],
+            learn_beta=False,
+            learn_threshold=False,
+            init_hidden=True,
+        )
 
-        # STDP traces for D only
+        # y population
+        self.spk_y = Neuron(
+            beta=params['beta_spk_y'],
+            threshold=params['threshold_spk_y'],
+            learn_beta=False,
+            learn_threshold=False,
+            init_hidden=True,
+        )
+
+        # STDP traces — reset per sample, not per batch
         self.trace_pre_D  = None
         self.trace_post_D = None
 
-        # Spike history for STDP — saved during forward, used in stdp_update()
+        # Spike history per timestep — saved during forward
         self._spk_input_hist = []
         self._spk_y_hist     = []
 
     def init_cell(self):
+        """
+        Reset LIF states and STDP traces.
+        Called at the start of EACH sample — following Diehl & Cook
+        rest phase between samples where all variables decay to rest.
+        """
         self.spk_m.init_leaky()
         self.spk_y.init_leaky()
-        self.spk_out.init_leaky()
+        self._reset_traces_and_history()
+        return torch.empty(0)   # spk_memory placeholder
+
+    def _reset_traces_and_history(self):
+        """Reset STDP traces and spike history — called between samples."""
         self.trace_pre_D  = None
         self.trace_post_D = None
         self._spk_input_hist = []
         self._spk_y_hist     = []
-        return torch.empty(0)
 
     def _init_traces(self, batch_size, device):
         self.trace_pre_D  = torch.zeros(batch_size, self.input_size,  device=device)
@@ -73,8 +112,9 @@ class L2MUCell(LMUCore):
 
     def forward(self, spk_input: torch.Tensor, spk_memory: torch.Tensor):
         """
-        Forward pass — clean, no in-place weight modifications.
-        Spike history is saved for STDP which runs separately after backward().
+        Forward pass — m and y populations only.
+        No e_x — spk_input fed directly into B via mean pooling
+        to one scalar per memory slot.
         """
         batch_size = spk_input.shape[0]
         device     = spk_input.device
@@ -87,52 +127,76 @@ class L2MUCell(LMUCore):
         if self.trace_pre_D is None:
             self._init_traces(batch_size, device)
 
-        # m population
-        u_t    = self.e_x(spk_input)
-        u_t_3d = u_t.unsqueeze(-1)
-        curr_m = self.A(spk_memory) + self.B(u_t_3d)
-        if self.discretizer == 'euler' and self.trainable_theta:
-            curr_m = curr_m + curr_m * self.theta_inv
-        spk_memory = self.spk_m(curr_m)
+        # m population: m[t+1] = A * m[t] + B * u(t)
+        # u(t) = mean of spk_input → scalar per memory slot
+        # shape: [B, 1] → unsqueeze → [B, 1, 1] → broadcast to [B, memory_size, 1]
+        u_t    = spk_input.mean(dim=-1, keepdim=True)   # [B, 1]
+        u_t_3d = u_t.unsqueeze(-1).expand(
+            batch_size, self.memory_size, 1
+        )                                                # [B, memory_size, 1]
+        curr_m    = self.A(spk_memory) + self.B(u_t_3d) # [B, memory_size, order]
+        spk_memory = self.spk_m(curr_m)                 # [B, memory_size, order]
 
-        # y population
+        # y population: y[t] = C * m[t] + D * x[t]
         curr_y = self.C(spk_memory).squeeze(-1) + self.D(spk_input)
-        spk_y  = self.spk_y(curr_y)
+        spk_y  = self.spk_y(curr_y)                     # [B, memory_size]
 
-        # out population
-        curr_out = self.W_out(spk_y)
-        spk_out  = self.spk_out(curr_out)
+        # Save for STDP
+        self._spk_input_hist.append(spk_input.detach())
+        self._spk_y_hist.append(spk_y.detach())
 
-        # Save spikes for STDP on D (detached — no gradient needed)
-        if self.training:
-            self._spk_input_hist.append(spk_input.detach())
-            self._spk_y_hist.append(spk_y.detach())
-
-        return spk_out, spk_memory
+        return spk_y, spk_memory
 
     def stdp_update(self):
         """
-        Apply STDP to D only using the spike history saved during forward().
-        W_out is now trained by backprop instead — it needs a gradient path to the loss.
-        Call this AFTER loss.backward() and optimizer.step().
+        Apply weight-dependent unsupervised STDP to D.
+        Call this after processing each sample (not batch).
+
+        Weight-dependent rule (Diehl & Cook 2015):
+            dW = A_plus  * (W_MAX - w) * trace_pre  * spk_post
+               - A_minus * (w - W_MIN) * trace_post * spk_pre
+
+        Weights near W_MAX: potentiation is small → natural ceiling
+        Weights near W_MIN: depression is small  → natural floor
+        This creates stable diverse weight patterns.
         """
         if not self._spk_input_hist:
-            return  # nothing to update (e.g. during val/test)
+            return
 
         with torch.no_grad():
+            w = self.D.weight   # [memory_size, input_size]
+
             for spk_input, spk_y in zip(
                 self._spk_input_hist,
                 self._spk_y_hist,
             ):
-                # --- STDP for D only (pre=spk_input, post=spk_y) ---
-                self.trace_pre_D  = self.STDP_TAU_PRE  * self.trace_pre_D  + spk_input
-                self.trace_post_D = self.STDP_TAU_POST * self.trace_post_D + spk_y
+                # Update traces
+                self.trace_pre_D  = (
+                    self.STDP_TAU_PRE  * self.trace_pre_D  + spk_input
+                )   # [B, input_size]
+                self.trace_post_D = (
+                    self.STDP_TAU_POST * self.trace_post_D + spk_y
+                )   # [B, memory_size]
 
-                dW_plus  = self.STDP_A_PLUS  * torch.einsum('bi,bj->ij', spk_y, self.trace_pre_D)    / spk_input.shape[0]
-                dW_minus = self.STDP_A_MINUS * torch.einsum('bi,bj->ij', self.trace_post_D, spk_input) / spk_input.shape[0]
-                self.D.weight.add_(dW_plus - dW_minus)
+                # Potentiation: post fires → strengthen from active pre
+                # Weight-dependent: scaled by (W_MAX - w)
+                dW_plus = self.STDP_A_PLUS * torch.einsum(
+                    'bi,bj->ij', spk_y, self.trace_pre_D
+                ) / spk_input.shape[0]   # [memory_size, input_size]
 
-        # Clear history for next batch
+                # Depression: pre fires → weaken toward active post
+                # Weight-dependent: scaled by (w - W_MIN)
+                dW_minus = self.STDP_A_MINUS * torch.einsum(
+                    'bi,bj->ij', self.trace_post_D, spk_input
+                ) / spk_input.shape[0]  # [memory_size, input_size]
+
+                # Weight-dependent update
+                dW = dW_plus * (self.W_MAX - w) - dW_minus * (w - self.W_MIN)
+                self.D.weight.add_(dW)
+
+            # Clip after all timesteps
+            self.D.weight.clamp_(self.W_MIN, self.W_MAX)
+
+        # Clear history for next sample
         self._spk_input_hist = []
         self._spk_y_hist     = []
-        self._spk_out_hist   = []

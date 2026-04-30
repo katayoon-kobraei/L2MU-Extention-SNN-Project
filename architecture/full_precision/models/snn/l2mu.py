@@ -4,11 +4,16 @@ from architecture.full_precision.models.snn.backend.l2mu.l2mu_cell import L2MUCe
 
 
 class L2MU(nn.Module):
-    def __init__(self, input_size, output_size, params, neuron_type='Leaky'):
+    """
+    Experiment 1 model — SSM core only (m + y populations).
+    Processes full batches for speed.
+    Traces reset at start of each batch via init_cell().
+    """
+
+    def __init__(self, input_size, params, neuron_type='Leaky'):
         super().__init__()
         self.l2mu_cell = L2MUCell(
             input_size=input_size,
-            output_size=output_size,
             params=params,
             neuron_type=neuron_type,
         )
@@ -16,18 +21,19 @@ class L2MU(nn.Module):
     def forward(self, input):
         """
         Args:
-            input: [T, B, input_size]  (time-first, batch second)
+            input: [T, B, input_size]
         Returns:
-            stacked spk_out: [T, B, output_size]
+            spk_y_stack: [T, B, memory_size]
         """
-        spk_memory = self.l2mu_cell.init_cell()   # empty tensor → zeros on first step
+        # Reset LIF states AND STDP traces at start of each batch
+        spk_memory = self.l2mu_cell.init_cell()
 
-        spk_out_list = []
+        spk_y_list = []
         for step in range(input.size(0)):
-            spk_out, spk_memory = self.l2mu_cell(
-                input[step].flatten(1),   # [B, input_size]
+            spk_y, spk_memory = self.l2mu_cell(
+                input[step].flatten(1),
                 spk_memory=spk_memory,
             )
-            spk_out_list.append(spk_out)
+            spk_y_list.append(spk_y)
 
-        return torch.stack(spk_out_list, dim=0)  # [T, B, output_size]
+        return torch.stack(spk_y_list, dim=0)  # [T, B, memory_size]
