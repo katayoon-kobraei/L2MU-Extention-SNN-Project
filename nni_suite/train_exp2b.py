@@ -83,8 +83,10 @@ def train_exp2b(
           f"({L2MUCell.NEURONS_PER_CLS} per class × {NUM_CLASSES} classes)")
     print(f"threshold_spk_y  : {params['threshold_spk_y']}")
     print(f"threshold_spk_out: {params['threshold_spk_out']}")
-    print(f"S2STDP_G         : {L2MUCell.S2STDP_G}")
+    print(f"R_TARGET         : {L2MUCell.R_TARGET}")
+    print(f"R_NON_TARGET     : {L2MUCell.R_NON_TARGET}")
     print(f"S2STDP_A_LR      : {L2MUCell.S2STDP_A_LR}")
+    print(f"S2STDP_A_LR_ERR  : {L2MUCell.S2STDP_A_LR_ERR}")
 
     # ── Sanity check: y-population spike rate before training ─────────────
     print("\n── Sanity check: y-population spike rate (first batch) ──")
@@ -146,17 +148,13 @@ def train_exp2b(
 
             # Error magnitude diagnostics (before update)
             R_mean = rates.mean(dim=1, keepdim=True)
-            g = L2MUCell.S2STDP_G
             tgt_neuron_idx = labels * L2MUCell.NEURONS_PER_CLS   # [B]
             batch_idx = torch.arange(B, device=device)
             # target error = rate of target neuron − desired
             tgt_rates_per_sample = rates[batch_idx, tgt_neuron_idx]
-            tgt_desired = (R_mean[:, 0] + (NUM_CLASSES - 1) / NUM_CLASSES * g).clamp(0, 1)
-            sum_error_tgt += (tgt_rates_per_sample - tgt_desired).abs().mean().item()
 
-            # non-target: mean over all non-target neurons
-            nontgt_desired = (R_mean[:, 0] - g / NUM_CLASSES).clamp(0, 1)
-            sum_error_nontgt += (rates[:, nontgt_idx].mean(dim=1) - nontgt_desired).abs().mean().item()
+            sum_error_tgt += (tgt_rates_per_sample - L2MUCell.R_TARGET).abs().mean().item()
+            sum_error_nontgt += (rates[:, nontgt_idx].mean(dim=1) - L2MUCell.R_NON_TARGET).abs().mean().item()
 
             # S2-STDP weight update
             model.l2mu_cell.s2stdp_update(labels)
@@ -252,7 +250,7 @@ if __name__ == '__main__':
         #   Observed: out_rate collapses to ~0.003 with threshold=1.0.
         #   Lower to 0.5 to ensure sustained firing from epoch 1.
         'beta_spk_out': 0.3,
-        'threshold_spk_out': 0.5,
+        'threshold_spk_out': 0.5,   # lower than threshold_spk_y to allow firing
     }
 
     train_exp2b(
