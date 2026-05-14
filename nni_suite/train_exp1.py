@@ -112,13 +112,13 @@ if __name__ == '__main__':
         'beta_spk_m': 0.35,
         'threshold_spk_m': 0.4,
         'beta_spk_y': 0.3,
-        'threshold_spk_y': 2.0,  # higher threshold to control spike rate
+        'threshold_spk_y': 5.0,  # higher threshold to control spike rate
     }
 
     train_exp1(
         params=params,
         num_epochs=150,
-        data_dir="../data/braille_full_splitted",
+        data_dir="data/braille_full_splitted",
         split=2,
-        save_dir="../model_insights/results/exp1",
+        save_dir="model_insights/results/exp1",
     )

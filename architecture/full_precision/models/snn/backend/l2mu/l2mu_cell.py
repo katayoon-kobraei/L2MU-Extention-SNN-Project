@@ -53,8 +53,8 @@ class L2MUCell(LMUCore):
         # W_out not needed in Exp1
         self.W_out.weight.requires_grad_(False)
 
-        # e_x is NOT used in Exp1 — B receives input directly
-        # We freeze it so it does not interfere
+        # e_x is a fixed random projection — applied once to x[t] before B and D
+        # not trained, just a fixed input encoder
         self.e_x.weight.requires_grad_(False)
 
         try:
@@ -107,14 +107,17 @@ class L2MUCell(LMUCore):
         self._spk_y_hist     = []
 
     def _init_traces(self, batch_size, device):
-        self.trace_pre_D  = torch.zeros(batch_size, self.input_size,  device=device)
+        # trace_pre_D tracks the pre-synaptic activity of D.
+        # Since D now receives u_t = e_x(spk_input) instead of raw spk_input,
+        # the pre-synaptic dimension changes from input_size (24) to memory_size (250).
+        # The trace shape must match D's input dimension for the STDP einsum to work.
+        self.trace_pre_D = torch.zeros(batch_size, self.memory_size, device=device)
         self.trace_post_D = torch.zeros(batch_size, self.memory_size, device=device)
 
     def forward(self, spk_input: torch.Tensor, spk_memory: torch.Tensor):
         """
         Forward pass — m and y populations only.
-        No e_x — spk_input fed directly into B via mean pooling
-        to one scalar per memory slot.
+        e_x applied once at input boundary, u_t shared between B and D.
         """
         batch_size = spk_input.shape[0]
         device     = spk_input.device
@@ -127,22 +130,23 @@ class L2MUCell(LMUCore):
         if self.trace_pre_D is None:
             self._init_traces(batch_size, device)
 
-        # m population: m[t+1] = A * m[t] + B * u(t)
-        # u(t) = mean of spk_input → scalar per memory slot
-        # shape: [B, 1] → unsqueeze → [B, 1, 1] → broadcast to [B, memory_size, 1]
-        u_t    = spk_input.mean(dim=-1, keepdim=True)   # [B, 1]
-        u_t_3d = u_t.unsqueeze(-1).expand(
-            batch_size, self.memory_size, 1
-        )                                                # [B, memory_size, 1]
-        curr_m    = self.A(spk_memory) + self.B(u_t_3d) # [B, memory_size, order]
+        # e_x is applied ONCE at the input boundary, projecting x[t] from input_size (24)
+        # to memory_size (250). The result u_t is shared between both B and D paths.
+        # This replaces the previous mean pooling (which gave all m neurons the same scalar)
+        # with a fixed random projection that gives each neuron a different linear combination
+        # of the 24 input channels, enabling proper specialization in both populations.
+
+        u_t    = self.e_x(spk_input)              # [B, memory_size] — projected once
+        u_t_3d = u_t.unsqueeze(-1)               # [B, memory_size, 1]
+        curr_m = self.A(spk_memory) + self.B(u_t_3d)
         spk_memory = self.spk_m(curr_m)                 # [B, memory_size, order]
 
         # y population: y[t] = C * m[t] + D * x[t]
-        curr_y = self.C(spk_memory).squeeze(-1) + self.D(spk_input)
+        curr_y = self.C(spk_memory).squeeze(-1) + self.D(u_t)   # D gets u_t not spk_input
         spk_y  = self.spk_y(curr_y)                     # [B, memory_size]
 
         # Save for STDP
-        self._spk_input_hist.append(spk_input.detach())
+        self._spk_input_hist.append(u_t.detach())  # save projected input
         self._spk_y_hist.append(spk_y.detach())
 
         return spk_y, spk_memory
@@ -164,7 +168,7 @@ class L2MUCell(LMUCore):
             return
 
         with torch.no_grad():
-            w = self.D.weight   # [memory_size, input_size]
+            w = self.D.weight    # [memory_size, memory_size] — D: u_t (250) → y (250)
 
             for spk_input, spk_y in zip(
                 self._spk_input_hist,
@@ -173,10 +177,10 @@ class L2MUCell(LMUCore):
                 # Update traces
                 self.trace_pre_D  = (
                     self.STDP_TAU_PRE  * self.trace_pre_D  + spk_input
-                )   # [B, input_size]
+                )    # [B, memory_size] — pre trace over u_t dimension
                 self.trace_post_D = (
                     self.STDP_TAU_POST * self.trace_post_D + spk_y
-                )   # [B, memory_size]
+                )   # [memory_size, memory_size] — dW shape matches D
 
                 # Potentiation: post fires → strengthen from active pre
                 # Weight-dependent: scaled by (W_MAX - w)

@@ -65,8 +65,11 @@ class LMUCore(nn.Module):
         self.C = CLinear(self.order, 1, bias=False)
         self._gen_C()
 
-        # D: trainable [memory_size, input_size]
-        self.D = XavierLinear(self.input_size, self.memory_size, bias=False)
+        # D: trainable [memory_size, memory_size]
+        # D now receives u_t = e_x(spk_input) instead of raw spk_input,
+        # so its input dimension changes from input_size (24) to memory_size (250).
+        self.D = XavierLinear(self.memory_size, self.memory_size, bias=False)
+
 
         # W_out: trainable [output_size, memory_size]
         self.W_out = XavierLinear(self.memory_size, self.output_size, bias=False)
