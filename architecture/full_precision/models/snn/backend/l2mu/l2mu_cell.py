@@ -52,8 +52,8 @@ class L2MUCell(LMUCore):
     # Learning rate calibration:
     #   per-synapse update ~ A_LR * |e| * rate_pre ~ 0.1 * 0.1 * 0.17 = 0.0017/epoch
     #   This moves W_std by ~0.002/epoch -> reaches ~0.1 difference after ~50 epochs.
-    S2STDP_A_LR     = 0.1    # Hebbian learning rate
-    S2STDP_A_LR_ERR = 0.002  # error-only rescue learning rate
+    S2STDP_A_LR     = 1.0    # Hebbian learning rate
+    S2STDP_A_LR_ERR = 0.02  # error-only rescue learning rate
 
     # Fixed absolute desired firing rates
     # Calibrated from sanity check: y_rate~0.17, init out_rate~0.08
@@ -161,7 +161,7 @@ class L2MUCell(LMUCore):
         curr_m     = self.A(spk_memory) + self.B(u_t.unsqueeze(-1))
         spk_memory = self.spk_m(curr_m)
 
-        curr_y = self.C(spk_memory).squeeze(-1) + self.D(spk_input)
+        curr_y = self.C(spk_memory).squeeze(-1) + self.D(u_t)
         spk_y  = self.spk_y(curr_y)
 
         curr_out = self.W_out(spk_y)

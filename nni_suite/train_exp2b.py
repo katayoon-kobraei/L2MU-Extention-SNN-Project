@@ -256,8 +256,8 @@ if __name__ == '__main__':
     train_exp2b(
         params=params,
         num_epochs=150,
-        data_dir="../data/braille_full_splitted",
+        data_dir="data/braille_full_splitted",
         split=2,
-        D_weights_path="../model_insights/results/exp1/D_weights.pt",
-        save_dir="../model_insights/results/exp2b",
+        D_weights_path="model_insights/results/exp1/D_weights.pt",
+        save_dir="model_insights/results/exp2b",
     )
