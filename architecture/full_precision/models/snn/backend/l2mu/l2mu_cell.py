@@ -134,7 +134,7 @@ class L2MUCell(LMUCore):
         spk_memory = self.spk_m(curr_m)
 
         # y population — D frozen from Exp1
-        curr_y = self.C(spk_memory).squeeze(-1) + self.D(spk_input)
+        curr_y = self.C(spk_memory).squeeze(-1) + self.D(u_t)
         spk_y  = self.spk_y(curr_y)             # [B, memory_size]
 
         # out population — W_out trained by STDP
