@@ -52,6 +52,11 @@ def train_exp1(params, num_epochs=150, data_dir="../data/braille_full_splitted",
     print(f"\nModel D weight shape: {model.l2mu_cell.D.weight.shape}")
     print(f"Initial D weight mean: {model.l2mu_cell.D.weight.mean().item():.4f}")
     print(f"Initial D weight std:  {model.l2mu_cell.D.weight.std().item():.4f}")
+
+    print(f"Model W_in weight shape: {model.l2mu_cell.W_in.weight.shape}")
+    print(f"Initial W_in weight mean: {model.l2mu_cell.W_in.weight.mean().item():.4f}")
+    print(f"Initial W_in weight std:  {model.l2mu_cell.W_in.weight.std().item():.4f}")
+
     print(f"\nStarting unsupervised STDP training for {num_epochs} epochs...\n")
 
     for epoch in range(num_epochs):
@@ -80,22 +85,26 @@ def train_exp1(params, num_epochs=150, data_dir="../data/braille_full_splitted",
         D_std  = model.l2mu_cell.D.weight.std().item()
         D_min  = model.l2mu_cell.D.weight.min().item()
         D_max  = model.l2mu_cell.D.weight.max().item()
+        W_in_mean = model.l2mu_cell.W_in.weight.mean().item()
+        W_in_std  = model.l2mu_cell.W_in.weight.std().item()
+        W_in_min  = model.l2mu_cell.W_in.weight.min().item()
+        W_in_max  = model.l2mu_cell.W_in.weight.max().item()
         avg_rate = total_spike_rate / num_batches
 
         print(
             f"Epoch {epoch+1:3d}/{num_epochs} | "
             f"y spike rate: {avg_rate:.4f} | "
-            f"D weight — mean: {D_mean:.4f} | "
-            f"std: {D_std:.4f} | "
-            f"min: {D_min:.4f} | "
-            f"max: {D_max:.4f}"
+            f"D weight — mean: {D_mean:.4f} | std: {D_std:.4f} | min: {D_min:.4f} | max: {D_max:.4f} | "
+            f"W_in weight — mean: {W_in_mean:.4f} | std: {W_in_std:.4f} | min: {W_in_min:.4f} | max: {W_in_max:.4f}"
         )
+        
 
     # --- Save D weights ---
     save_path = Path(save_dir)
     save_path.mkdir(parents=True, exist_ok=True)
 
     torch.save(model.l2mu_cell.D.weight.data, save_path / 'D_weights.pt')
+    torch.save(model.l2mu_cell.W_in.weight.data, save_path / 'D_weights.pt')
     torch.save(model.state_dict(), save_path / 'model_exp1.pt')
     print(f"\nD weights saved to: {save_path / 'D_weights.pt'}")
 
@@ -112,7 +121,7 @@ if __name__ == '__main__':
         'beta_spk_m': 0.35,
         'threshold_spk_m': 0.4,
         'beta_spk_y': 0.3,
-        'threshold_spk_y': 5.0,  # higher threshold to control spike rate
+        'threshold_spk_y': 8.0,  # higher threshold to control spike rate
     }
 
     train_exp1(

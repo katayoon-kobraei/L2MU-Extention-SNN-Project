@@ -66,7 +66,7 @@ class LMUCore(nn.Module):
         self._gen_C()
 
         # D: trainable [memory_size, memory_size]
-        # D now receives u_t = e_x(spk_input) instead of raw spk_input,
+        # D now receives u_t = W_in(spk_input) instead of raw spk_input,
         # so its input dimension changes from input_size (24) to memory_size (250).
         self.D = XavierLinear(self.memory_size, self.memory_size, bias=False)
 
@@ -74,9 +74,9 @@ class LMUCore(nn.Module):
         # W_out: trainable [output_size, memory_size]
         self.W_out = XavierLinear(self.memory_size, self.output_size, bias=False)
 
-        # e_x: input encoder [input_size -> memory_size]
+        # W_in: input encoder [input_size -> memory_size]
         # Projects spiking input to one scalar per memory slot (u(t) in LMU)
-        self.e_x = LCLinear(self.input_size, self.memory_size, bias=False)
+        self.W_in = XavierLinear(self.input_size, self.memory_size, bias=False)
 
     @property
     def theta(self):

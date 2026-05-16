@@ -14,7 +14,7 @@ class L2MUCell(LMUCore):
 
     Architecture:
         m population: m[t+1] = A * m[t] + B * x[t]   (A, B fixed)
-        y population: y[t]   = C * m[t] + D * x[t]   (C fixed, D STDP)
+        y population: y[t] = C * m[t] + D * x[t]   (C fixed, D STDP)
 
     Fixes vs previous version:
         1. Removed e_x — B now receives spk_input directly summed
@@ -26,9 +26,9 @@ class L2MUCell(LMUCore):
            depression — creates natural stabilization
     """
 
-    STDP_A_PLUS   = 0.02
-    STDP_A_MINUS  = 0.02
-    STDP_TAU_PRE  = 0.95
+    STDP_A_PLUS = 0.005
+    STDP_A_MINUS = 0.005
+    STDP_TAU_PRE = 0.95
     STDP_TAU_POST = 0.95
 
     W_MAX = 1.0
@@ -53,9 +53,8 @@ class L2MUCell(LMUCore):
         # W_out not needed in Exp1
         self.W_out.weight.requires_grad_(False)
 
-        # e_x is a fixed random projection — applied once to x[t] before B and D
-        # not trained, just a fixed input encoder
-        self.e_x.weight.requires_grad_(False)
+        # W_in trained by STDP — excluded from optimizer
+        self.W_in.weight.requires_grad_(False)
 
         try:
             Neuron = getattr(snntorch, neuron_type)
@@ -81,12 +80,15 @@ class L2MUCell(LMUCore):
         )
 
         # STDP traces — reset per sample, not per batch
-        self.trace_pre_D  = None
+        self.trace_pre_D = None
         self.trace_post_D = None
+        self.trace_pre_Win = None   # pre = spk_input (raw 24-dim)
+        self.trace_post_Win = None   # post = spk_y (250-dim)
 
         # Spike history per timestep — saved during forward
-        self._spk_input_hist = []
-        self._spk_y_hist     = []
+        self._spk_input_hist = []   # stores u_t (projected input for D)
+        self._spk_raw_hist = []   # stores raw spk_input (for W_in)
+        self._spk_y_hist = []
 
     def init_cell(self):
         """
@@ -101,10 +103,13 @@ class L2MUCell(LMUCore):
 
     def _reset_traces_and_history(self):
         """Reset STDP traces and spike history — called between samples."""
-        self.trace_pre_D  = None
+        self.trace_pre_D = None
         self.trace_post_D = None
+        self.trace_pre_Win = None
+        self.trace_post_Win = None
+        self._spk_raw_hist = []
         self._spk_input_hist = []
-        self._spk_y_hist     = []
+        self._spk_y_hist = []
 
     def _init_traces(self, batch_size, device):
         # trace_pre_D tracks the pre-synaptic activity of D.
@@ -113,6 +118,8 @@ class L2MUCell(LMUCore):
         # The trace shape must match D's input dimension for the STDP einsum to work.
         self.trace_pre_D = torch.zeros(batch_size, self.memory_size, device=device)
         self.trace_post_D = torch.zeros(batch_size, self.memory_size, device=device)
+        self.trace_pre_Win = torch.zeros(batch_size, self.input_size, device=device)
+        self.trace_post_Win = torch.zeros(batch_size, self.memory_size, device=device)
 
     def forward(self, spk_input: torch.Tensor, spk_memory: torch.Tensor):
         """
@@ -120,7 +127,7 @@ class L2MUCell(LMUCore):
         e_x applied once at input boundary, u_t shared between B and D.
         """
         batch_size = spk_input.shape[0]
-        device     = spk_input.device
+        device = spk_input.device
 
         if spk_memory.numel() == 0:
             spk_memory = torch.zeros(
@@ -136,17 +143,27 @@ class L2MUCell(LMUCore):
         # with a fixed random projection that gives each neuron a different linear combination
         # of the 24 input channels, enabling proper specialization in both populations.
 
-        u_t    = self.e_x(spk_input)              # [B, memory_size] — projected once
+        u_t = self.W_in(spk_input)              # [B, memory_size] — projected once
+
+        u_t = self.W_in(spk_input)   # [B, memory_size]
+
+        # temporary DEBUG — check if u_t is uniform across memory slots
+        print(f"u_t std across memory dim: {u_t.std(dim=1).mean().item():.6f}")
+        print(f"u_t mean: {u_t.mean().item():.4f}")
+        print(f"W_in row std (how different rows are): {self.W_in.weight.std(dim=1).mean().item():.6f}")
+
+
         u_t_3d = u_t.unsqueeze(-1)               # [B, memory_size, 1]
         curr_m = self.A(spk_memory) + self.B(u_t_3d)
         spk_memory = self.spk_m(curr_m)                 # [B, memory_size, order]
 
         # y population: y[t] = C * m[t] + D * x[t]
         curr_y = self.C(spk_memory).squeeze(-1) + self.D(u_t)   # D gets u_t not spk_input
-        spk_y  = self.spk_y(curr_y)                     # [B, memory_size]
+        spk_y = self.spk_y(curr_y)                     # [B, memory_size]
 
         # Save for STDP
         self._spk_input_hist.append(u_t.detach())  # save projected input
+        self._spk_raw_hist.append(spk_input.detach())
         self._spk_y_hist.append(spk_y.detach())
 
         return spk_y, spk_memory
@@ -168,39 +185,37 @@ class L2MUCell(LMUCore):
             return
 
         with torch.no_grad():
-            w = self.D.weight    # [memory_size, memory_size] — D: u_t (250) → y (250)
+            w_D = self.D.weight      # [memory_size, memory_size]
+            w_Win = self.W_in.weight   # [memory_size, input_size]    # [memory_size, memory_size] — D: u_t (250) → y (250)
 
-            for spk_input, spk_y in zip(
+            for spk_raw, u_t, spk_y in zip(
+                self._spk_raw_hist,
                 self._spk_input_hist,
                 self._spk_y_hist,
             ):
-                # Update traces
-                self.trace_pre_D  = (
-                    self.STDP_TAU_PRE  * self.trace_pre_D  + spk_input
-                )    # [B, memory_size] — pre trace over u_t dimension
-                self.trace_post_D = (
-                    self.STDP_TAU_POST * self.trace_post_D + spk_y
-                )   # [memory_size, memory_size] — dW shape matches D
+                # ── W_in traces (pre=spk_raw 24-dim, post=spk_y 250-dim) ──
+                self.trace_pre_Win = self.STDP_TAU_PRE  * self.trace_pre_Win  + spk_raw
+                self.trace_post_Win = self.STDP_TAU_POST * self.trace_post_Win + spk_y
 
-                # Potentiation: post fires → strengthen from active pre
-                # Weight-dependent: scaled by (W_MAX - w)
-                dW_plus = self.STDP_A_PLUS * torch.einsum(
-                    'bi,bj->ij', spk_y, self.trace_pre_D
-                ) / spk_input.shape[0]   # [memory_size, input_size]
+                # W_in update
+                dW_plus_Win = self.STDP_A_PLUS  * torch.einsum('bi,bj->ij', spk_y, self.trace_pre_Win)  / spk_raw.shape[0]
+                dW_minus_Win = self.STDP_A_MINUS * torch.einsum('bi,bj->ij', self.trace_post_Win, spk_raw) / spk_raw.shape[0]
+                dW_Win = dW_plus_Win * (self.W_MAX - w_Win) - dW_minus_Win * (w_Win - self.W_MIN)
+                self.W_in.weight.add_(dW_Win)
 
-                # Depression: pre fires → weaken toward active post
-                # Weight-dependent: scaled by (w - W_MIN)
-                dW_minus = self.STDP_A_MINUS * torch.einsum(
-                    'bi,bj->ij', self.trace_post_D, spk_input
-                ) / spk_input.shape[0]  # [memory_size, input_size]
+                # ── D traces (pre=u_t 250-dim, post=spk_y 250-dim) ──
+                self.trace_pre_D = self.STDP_TAU_PRE  * self.trace_pre_D  + u_t
+                self.trace_post_D = self.STDP_TAU_POST * self.trace_post_D + spk_y
 
-                # Weight-dependent update
-                dW = dW_plus * (self.W_MAX - w) - dW_minus * (w - self.W_MIN)
-                self.D.weight.add_(dW)
+                # D update (unchanged)
+                dW_plus_D = self.STDP_A_PLUS  * torch.einsum('bi,bj->ij', spk_y, self.trace_pre_D)  / u_t.shape[0]
+                dW_minus_D = self.STDP_A_MINUS * torch.einsum('bi,bj->ij', self.trace_post_D, u_t)   / u_t.shape[0]
+                dW_D = dW_plus_D * (self.W_MAX - w_D) - dW_minus_D * (w_D - self.W_MIN)
+                self.D.weight.add_(dW_D)
 
-            # Clip after all timesteps
+            self.W_in.weight.clamp_(self.W_MIN, self.W_MAX)
             self.D.weight.clamp_(self.W_MIN, self.W_MAX)
 
-        # Clear history for next sample
+        self._spk_raw_hist = []
         self._spk_input_hist = []
-        self._spk_y_hist     = []
+        self._spk_y_hist = []
