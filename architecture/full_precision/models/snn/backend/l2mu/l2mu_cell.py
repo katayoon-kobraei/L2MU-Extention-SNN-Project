@@ -41,7 +41,7 @@ class L2MUCell(LMUCore):
         self.init_parameters()
 
         # e_x: fixed random projection (same as Exp1)
-        self.e_x.weight.requires_grad_(False)
+        self.W_in.weight.requires_grad_(False)
 
         # D: frozen — loaded from Exp1
         self.D.weight.requires_grad_(False)
@@ -99,6 +99,14 @@ class L2MUCell(LMUCore):
         self.D.weight.requires_grad_(False)
         print(f"Loaded D weights from {D_weights_path}")
         print(f"D weight mean: {self.D.weight.mean().item():.4f}")
+    
+    def load_W_in_from_exp1(self, W_in_weights_path):
+        """Load W_in weights from Experiment 1 and freeze."""
+        W_in_weights = torch.load(W_in_weights_path, map_location='cpu')
+        self.W_in.weight.data.copy_(W_in_weights)
+        self.W_in.weight.requires_grad_(False)
+        print(f"Loaded W_in weights from {W_in_weights_path}")
+        print(f"W_in weight mean: {self.W_in.weight.mean().item():.4f}")
 
     def init_cell(self):
         """Reset LIF states and STDP traces — called once per batch."""
@@ -128,13 +136,13 @@ class L2MUCell(LMUCore):
             self._init_traces(batch_size, device)
 
         # m population
-        u_t    = self.e_x(spk_input)
+        u_t    = self.W_in(spk_input)            # W_in replaces e_x
         u_t_3d = u_t.unsqueeze(-1)
         curr_m = self.A(spk_memory) + self.B(u_t_3d)
         spk_memory = self.spk_m(curr_m)
 
         # y population — D frozen from Exp1
-        curr_y = self.C(spk_memory).squeeze(-1) + self.D(u_t)
+        curr_y = self.C(spk_memory).squeeze(-1) + self.D(spk_input)  # D gets raw input
         spk_y  = self.spk_y(curr_y)             # [B, memory_size]
 
         # out population — W_out trained by STDP

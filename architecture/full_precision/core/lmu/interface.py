@@ -15,7 +15,7 @@ class LMUCore(nn.Module):
     D is a generic trainable weight matrix.
 
     Removed from the original L2MU:
-        - e_x, e_h, e_m  (encoding vectors)
+        - e_h, e_m  (encoding vectors)
         - W_x, W_h, W_m  (hidden-state kernels)
         - hidden_size / hidden state entirely
         - output_transformation linear layer
@@ -66,14 +66,14 @@ class LMUCore(nn.Module):
         self._gen_C()
 
         # D: trainable [memory_size, input_size]
-        self.D = XavierLinear(self.memory_size, self.memory_size, bias=False)
+        self.D = XavierLinear(self.input_size, self.memory_size, bias=False)
 
         # W_out: trainable [output_size, memory_size]
         self.W_out = XavierLinear(self.memory_size, self.output_size, bias=False)
 
         # e_x: input encoder [input_size -> memory_size]
         # Projects spiking input to one scalar per memory slot (u(t) in LMU)
-        self.e_x = LCLinear(self.input_size, self.memory_size, bias=False)
+        self.W_in = XavierLinear(self.input_size, self.memory_size, bias=False)
 
     @property
     def theta(self):

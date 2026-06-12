@@ -32,6 +32,7 @@ def train_exp2a(params, num_epochs=150,
                 data_dir="data/braille_full_splitted",
                 split=2,
                 D_weights_path="model_insights/results/exp1/D_weights.pt",
+                W_in_weights_path="model_insights/results/exp1/W_in_weights.pt",
                 save_dir="model_insights/results/exp2a"):
 
     seed_everything(42)
@@ -60,6 +61,7 @@ def train_exp2a(params, num_epochs=150,
 
     # Load D weights from Exp1 and freeze
     model.l2mu_cell.load_D_from_exp1(D_weights_path)
+    model.l2mu_cell.load_W_in_from_exp1(W_in_weights_path)
 
     print(f"\nW_out shape: {model.l2mu_cell.W_out.weight.shape}")
     print(f"\n{'='*60}")
@@ -201,7 +203,7 @@ if __name__ == '__main__':
         'beta_spk_y': 0.3,
         'threshold_spk_y': 2.0,
         'beta_spk_out': 0.3,
-        'threshold_spk_out': 75.0,
+        'threshold_spk_out': 1.0,
     }
 
     train_exp2a(
@@ -210,5 +212,6 @@ if __name__ == '__main__':
         data_dir="data/braille_full_splitted",
         split=2,
         D_weights_path="model_insights/results/exp1/D_weights.pt",
+        W_in_weights_path="model_insights/results/exp1/W_in_weights.pt",
         save_dir="model_insights/results/exp2a",
     )
