@@ -68,7 +68,7 @@ class LMUCore(nn.Module):
         # D: trainable [memory_size, memory_size]
         # D now receives u_t = W_in(spk_input) instead of raw spk_input,
         # so its input dimension changes from input_size (24) to memory_size (250).
-        self.D = XavierLinear(self.memory_size, self.memory_size, bias=False)
+        self.D = XavierLinear(self.input_size, self.memory_size, bias=False)
 
 
         # W_out: trainable [output_size, memory_size]

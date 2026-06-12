@@ -26,13 +26,25 @@ class L2MUCell(LMUCore):
            depression — creates natural stabilization
     """
 
-    STDP_A_PLUS = 0.005
-    STDP_A_MINUS = 0.005
-    STDP_TAU_PRE = 0.95
-    STDP_TAU_POST = 0.95
+    # D hyperparameters
+    STDP_A_PLUS_D   = 0.02
+    STDP_A_MINUS_D  = 0.01
+    STDP_TAU_PRE_D  = 0.95
+    STDP_TAU_POST_D = 0.95
+
+    # W_in hyperparameters — different to break symmetry
+    STDP_A_PLUS_WIN   = 0.01
+    STDP_A_MINUS_WIN  = 0.005
+    STDP_TAU_PRE_WIN  = 0.80
+    STDP_TAU_POST_WIN = 0.80
+
+    # STDP_A_PLUS = 0.005
+    # STDP_A_MINUS = 0.005
+    # STDP_TAU_PRE = 0.95
+    # STDP_TAU_POST = 0.95
 
     W_MAX = 1.0
-    W_MIN = 0.0
+    W_MIN = -1.0
 
     def __init__(self, input_size, params,
                  trainable_theta=False, neuron_type='Leaky'):
@@ -49,12 +61,14 @@ class L2MUCell(LMUCore):
 
         # D trained by STDP only — excluded from any optimizer
         self.D.weight.requires_grad_(False)
+        torch.nn.init.xavier_uniform_(self.D.weight)
 
         # W_out not needed in Exp1
         self.W_out.weight.requires_grad_(False)
 
         # W_in trained by STDP — excluded from optimizer
         self.W_in.weight.requires_grad_(False)
+        torch.nn.init.xavier_uniform_(self.W_in.weight)
 
         try:
             Neuron = getattr(snntorch, neuron_type)
@@ -116,7 +130,7 @@ class L2MUCell(LMUCore):
         # Since D now receives u_t = e_x(spk_input) instead of raw spk_input,
         # the pre-synaptic dimension changes from input_size (24) to memory_size (250).
         # The trace shape must match D's input dimension for the STDP einsum to work.
-        self.trace_pre_D = torch.zeros(batch_size, self.memory_size, device=device)
+        self.trace_pre_D = torch.zeros(batch_size, self.input_size, device=device)
         self.trace_post_D = torch.zeros(batch_size, self.memory_size, device=device)
         self.trace_pre_Win = torch.zeros(batch_size, self.input_size, device=device)
         self.trace_post_Win = torch.zeros(batch_size, self.memory_size, device=device)
@@ -143,26 +157,25 @@ class L2MUCell(LMUCore):
         # with a fixed random projection that gives each neuron a different linear combination
         # of the 24 input channels, enabling proper specialization in both populations.
 
-        u_t = self.W_in(spk_input)              # [B, memory_size] — projected once
-
         u_t = self.W_in(spk_input)   # [B, memory_size]
 
-        # temporary DEBUG — check if u_t is uniform across memory slots
-        print(f"u_t std across memory dim: {u_t.std(dim=1).mean().item():.6f}")
-        print(f"u_t mean: {u_t.mean().item():.4f}")
-        print(f"W_in row std (how different rows are): {self.W_in.weight.std(dim=1).mean().item():.6f}")
-
+        # temporary DEBUG
+        if not hasattr(self, '_debug_printed'):
+            self._debug_printed = True
+            print(f"u_t std across memory dim: {u_t.std(dim=1).mean().item():.6f}")
+            print(f"u_t mean: {u_t.mean().item():.4f}")
+            print(f"W_in row std (how different rows are): {self.W_in.weight.std(dim=1).mean().item():.6f}")
 
         u_t_3d = u_t.unsqueeze(-1)               # [B, memory_size, 1]
         curr_m = self.A(spk_memory) + self.B(u_t_3d)
         spk_memory = self.spk_m(curr_m)                 # [B, memory_size, order]
 
         # y population: y[t] = C * m[t] + D * x[t]
-        curr_y = self.C(spk_memory).squeeze(-1) + self.D(u_t)   # D gets u_t not spk_input
+        curr_y = self.C(spk_memory).squeeze(-1) + self.D(spk_input)  # D gets u_t not spk_input
         spk_y = self.spk_y(curr_y)                     # [B, memory_size]
 
         # Save for STDP
-        self._spk_input_hist.append(u_t.detach())  # save projected input
+        self._spk_input_hist.append(spk_input.detach())  # save projected input
         self._spk_raw_hist.append(spk_input.detach())
         self._spk_y_hist.append(spk_y.detach())
 
@@ -194,22 +207,22 @@ class L2MUCell(LMUCore):
                 self._spk_y_hist,
             ):
                 # ── W_in traces (pre=spk_raw 24-dim, post=spk_y 250-dim) ──
-                self.trace_pre_Win = self.STDP_TAU_PRE  * self.trace_pre_Win  + spk_raw
-                self.trace_post_Win = self.STDP_TAU_POST * self.trace_post_Win + spk_y
-
+                self.trace_pre_Win  = self.STDP_TAU_PRE_WIN  * self.trace_pre_Win  + spk_raw
+                self.trace_post_Win = self.STDP_TAU_POST_WIN * self.trace_post_Win + spk_y
+                
                 # W_in update
-                dW_plus_Win = self.STDP_A_PLUS  * torch.einsum('bi,bj->ij', spk_y, self.trace_pre_Win)  / spk_raw.shape[0]
-                dW_minus_Win = self.STDP_A_MINUS * torch.einsum('bi,bj->ij', self.trace_post_Win, spk_raw) / spk_raw.shape[0]
+                dW_plus_Win = self.STDP_A_PLUS_WIN * torch.einsum('bi,bj->ij', spk_y, self.trace_pre_Win)  / spk_raw.shape[0]
+                dW_minus_Win = self.STDP_A_MINUS_WIN * torch.einsum('bi,bj->ij', self.trace_post_Win, spk_raw) / spk_raw.shape[0]
                 dW_Win = dW_plus_Win * (self.W_MAX - w_Win) - dW_minus_Win * (w_Win - self.W_MIN)
                 self.W_in.weight.add_(dW_Win)
 
                 # ── D traces (pre=u_t 250-dim, post=spk_y 250-dim) ──
-                self.trace_pre_D = self.STDP_TAU_PRE  * self.trace_pre_D  + u_t
-                self.trace_post_D = self.STDP_TAU_POST * self.trace_post_D + spk_y
+                self.trace_pre_D = self.STDP_TAU_PRE_D  * self.trace_pre_D  + u_t
+                self.trace_post_D = self.STDP_TAU_POST_D * self.trace_post_D + spk_y
 
                 # D update (unchanged)
-                dW_plus_D = self.STDP_A_PLUS  * torch.einsum('bi,bj->ij', spk_y, self.trace_pre_D)  / u_t.shape[0]
-                dW_minus_D = self.STDP_A_MINUS * torch.einsum('bi,bj->ij', self.trace_post_D, u_t)   / u_t.shape[0]
+                dW_plus_D = self.STDP_A_PLUS_D  * torch.einsum('bi,bj->ij', spk_y, self.trace_pre_D)  / u_t.shape[0]
+                dW_minus_D = self.STDP_A_MINUS_D * torch.einsum('bi,bj->ij', self.trace_post_D, u_t)   / u_t.shape[0]
                 dW_D = dW_plus_D * (self.W_MAX - w_D) - dW_minus_D * (w_D - self.W_MIN)
                 self.D.weight.add_(dW_D)
 

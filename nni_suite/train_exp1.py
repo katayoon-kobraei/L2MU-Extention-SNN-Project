@@ -104,7 +104,7 @@ def train_exp1(params, num_epochs=150, data_dir="../data/braille_full_splitted",
     save_path.mkdir(parents=True, exist_ok=True)
 
     torch.save(model.l2mu_cell.D.weight.data, save_path / 'D_weights.pt')
-    torch.save(model.l2mu_cell.W_in.weight.data, save_path / 'D_weights.pt')
+    torch.save(model.l2mu_cell.W_in.weight.data, save_path / 'W_in_weights.pt')
     torch.save(model.state_dict(), save_path / 'model_exp1.pt')
     print(f"\nD weights saved to: {save_path / 'D_weights.pt'}")
 
@@ -121,7 +121,7 @@ if __name__ == '__main__':
         'beta_spk_m': 0.35,
         'threshold_spk_m': 0.4,
         'beta_spk_y': 0.3,
-        'threshold_spk_y': 8.0,  # higher threshold to control spike rate
+        'threshold_spk_y': 2.0,  # higher threshold to control spike rate
     }
 
     train_exp1(
