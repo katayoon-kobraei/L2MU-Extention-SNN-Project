@@ -44,7 +44,7 @@ class L2MUCell(LMUCore):
     # STDP_TAU_POST = 0.95
 
     W_MAX = 1.0
-    W_MIN = -1.0
+    W_MIN = 0.0
 
     def __init__(self, input_size, params,
                  trainable_theta=False, neuron_type='Leaky'):
@@ -59,16 +59,19 @@ class L2MUCell(LMUCore):
         )
         self.init_parameters()
 
+        self._train_Win = True   # W_in trains first
+        self._train_D   = False  # D frozen initially
+        
         # D trained by STDP only — excluded from any optimizer
         self.D.weight.requires_grad_(False)
-        torch.nn.init.xavier_uniform_(self.D.weight)
+        torch.nn.init.uniform_(self.D.weight, 0.0, 1.0)
 
         # W_out not needed in Exp1
         self.W_out.weight.requires_grad_(False)
 
         # W_in trained by STDP — excluded from optimizer
         self.W_in.weight.requires_grad_(False)
-        torch.nn.init.xavier_uniform_(self.W_in.weight)
+        torch.nn.init.uniform_(self.W_in.weight, 0.0, 1.0)
 
         try:
             Neuron = getattr(snntorch, neuron_type)
@@ -104,6 +107,7 @@ class L2MUCell(LMUCore):
         self._spk_raw_hist = []   # stores raw spk_input (for W_in)
         self._spk_y_hist = []
 
+
     def init_cell(self):
         """
         Reset LIF states and STDP traces.
@@ -135,6 +139,25 @@ class L2MUCell(LMUCore):
         self.trace_pre_Win = torch.zeros(batch_size, self.input_size, device=device)
         self.trace_post_Win = torch.zeros(batch_size, self.memory_size, device=device)
 
+    def freeze_Win(self):
+        """Freeze W_in — stop STDP updates for W_in."""
+        self._train_Win = False
+        print("W_in frozen")
+
+    def unfreeze_Win(self):
+        """Unfreeze W_in — resume STDP updates for W_in."""
+        self._train_Win = True
+
+    def freeze_D(self):
+        """Freeze D — stop STDP updates for D."""
+        self._train_D = False
+        print("D frozen")
+
+    def unfreeze_D(self):
+        """Unfreeze D — resume STDP updates for D."""
+        self._train_D = True
+
+        
     def forward(self, spk_input: torch.Tensor, spk_memory: torch.Tensor):
         """
         Forward pass — m and y populations only.
@@ -206,28 +229,30 @@ class L2MUCell(LMUCore):
                 self._spk_input_hist,
                 self._spk_y_hist,
             ):
-                # ── W_in traces (pre=spk_raw 24-dim, post=spk_y 250-dim) ──
-                self.trace_pre_Win  = self.STDP_TAU_PRE_WIN  * self.trace_pre_Win  + spk_raw
-                self.trace_post_Win = self.STDP_TAU_POST_WIN * self.trace_post_Win + spk_y
-                
-                # W_in update
-                dW_plus_Win = self.STDP_A_PLUS_WIN * torch.einsum('bi,bj->ij', spk_y, self.trace_pre_Win)  / spk_raw.shape[0]
-                dW_minus_Win = self.STDP_A_MINUS_WIN * torch.einsum('bi,bj->ij', self.trace_post_Win, spk_raw) / spk_raw.shape[0]
-                dW_Win = dW_plus_Win * (self.W_MAX - w_Win) - dW_minus_Win * (w_Win - self.W_MIN)
-                self.W_in.weight.add_(dW_Win)
+            
+                if self._train_Win:
+                        # W_in traces and update
+                    self.trace_pre_Win  = self.STDP_TAU_PRE_WIN  * self.trace_pre_Win  + spk_raw
+                    self.trace_post_Win = self.STDP_TAU_POST_WIN * self.trace_post_Win + spk_y
+                    dW_plus_Win  = self.STDP_A_PLUS_WIN  * torch.einsum('bi,bj->ij', spk_y, self.trace_pre_Win)  / spk_raw.shape[0]
+                    dW_minus_Win = self.STDP_A_MINUS_WIN * torch.einsum('bi,bj->ij', self.trace_post_Win, spk_raw) / spk_raw.shape[0]
+                    dW_Win = dW_plus_Win * (self.W_MAX - w_Win) - dW_minus_Win * (w_Win - self.W_MIN)
+                    self.W_in.weight.add_(dW_Win)
 
-                # ── D traces (pre=u_t 250-dim, post=spk_y 250-dim) ──
-                self.trace_pre_D = self.STDP_TAU_PRE_D  * self.trace_pre_D  + u_t
-                self.trace_post_D = self.STDP_TAU_POST_D * self.trace_post_D + spk_y
+                if self._train_D:
+                    self.trace_pre_D  = self.STDP_TAU_PRE_D  * self.trace_pre_D  + u_t
+                    self.trace_post_D = self.STDP_TAU_POST_D * self.trace_post_D + spk_y
+                    dW_plus_D  = self.STDP_A_PLUS_D  * torch.einsum('bi,bj->ij', spk_y, self.trace_pre_D)  / u_t.shape[0]
+                    dW_minus_D = self.STDP_A_MINUS_D * torch.einsum('bi,bj->ij', self.trace_post_D, u_t)   / u_t.shape[0]
+                    dW_D = dW_plus_D * (self.W_MAX - w_D) - dW_minus_D * (w_D - self.W_MIN)
+                    self.D.weight.add_(dW_D)
 
-                # D update (unchanged)
-                dW_plus_D = self.STDP_A_PLUS_D  * torch.einsum('bi,bj->ij', spk_y, self.trace_pre_D)  / u_t.shape[0]
-                dW_minus_D = self.STDP_A_MINUS_D * torch.einsum('bi,bj->ij', self.trace_post_D, u_t)   / u_t.shape[0]
-                dW_D = dW_plus_D * (self.W_MAX - w_D) - dW_minus_D * (w_D - self.W_MIN)
-                self.D.weight.add_(dW_D)
+            if self._train_Win:
+                self.W_in.weight.clamp_(self.W_MIN, self.W_MAX)
+            if self._train_D:
+                self.D.weight.clamp_(self.W_MIN, self.W_MAX)
 
-            self.W_in.weight.clamp_(self.W_MIN, self.W_MAX)
-            self.D.weight.clamp_(self.W_MIN, self.W_MAX)
+            
 
         self._spk_raw_hist = []
         self._spk_input_hist = []

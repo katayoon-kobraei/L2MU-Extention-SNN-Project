@@ -24,7 +24,7 @@ from architecture.full_precision.models.snn.l2mu import L2MU
 torch.set_float32_matmul_precision('high')
 
 
-def train_exp1(params, num_epochs=150, data_dir="../data/braille_full_splitted",
+def train_exp1(params, PHASE1_EPOCHS=75, PHASE2_EPOCHS=75, data_dir="../data/braille_full_splitted",
                split=2, save_dir="../model_insights/results/exp1"):
 
     seed_everything(42)
@@ -57,45 +57,72 @@ def train_exp1(params, num_epochs=150, data_dir="../data/braille_full_splitted",
     print(f"Initial W_in weight mean: {model.l2mu_cell.W_in.weight.mean().item():.4f}")
     print(f"Initial W_in weight std:  {model.l2mu_cell.W_in.weight.std().item():.4f}")
 
-    print(f"\nStarting unsupervised STDP training for {num_epochs} epochs...\n")
+    PHASE1_EPOCHS = 75  # train W_in only
+    PHASE2_EPOCHS = 75  # train D only
 
-    for epoch in range(num_epochs):
+    # ── PHASE 1: Train W_in only ──────────────────────────────────────
+    print(f"\n{'='*60}")
+    print("PHASE 1 — Train W_in only (D frozen)")
+    print(f"{'='*60}\n")
+
+    model.l2mu_cell._train_Win = True
+    model.l2mu_cell._train_D   = False
+
+    for epoch in range(PHASE1_EPOCHS):
 
         total_spike_rate = 0.0
         num_batches = 0
 
         for data, _ in train_loader:
-            # data: [B, T, input_size]
-            data = data.to(device)
-            data = data.swapaxes(0, 1)   # [T, B, input_size]
-
-            # Forward pass — full batch at once
-            # init_cell() resets LIF states + traces at start of each batch
+            data = data.to(device).swapaxes(0, 1)
             with torch.no_grad():
-                spk_y = model(data)      # [T, B, memory_size]
-
+                spk_y = model(data)
             total_spike_rate += spk_y.mean().item()
             num_batches += 1
-
-            # STDP update after each batch
             model.l2mu_cell.stdp_update()
 
-        # --- Epoch monitoring ---
-        D_mean = model.l2mu_cell.D.weight.mean().item()
-        D_std  = model.l2mu_cell.D.weight.std().item()
-        D_min  = model.l2mu_cell.D.weight.min().item()
-        D_max  = model.l2mu_cell.D.weight.max().item()
         W_in_mean = model.l2mu_cell.W_in.weight.mean().item()
         W_in_std  = model.l2mu_cell.W_in.weight.std().item()
-        W_in_min  = model.l2mu_cell.W_in.weight.min().item()
-        W_in_max  = model.l2mu_cell.W_in.weight.max().item()
+        avg_rate  = total_spike_rate / num_batches
+
+        print(
+            f"[Phase1] Epoch {epoch+1:3d}/{PHASE1_EPOCHS} | "
+            f"y spike rate: {avg_rate:.4f} | "
+            f"W_in — mean: {W_in_mean:.4f} | std: {W_in_std:.4f}"
+        )
+
+    # freeze W_in, unfreeze D
+    model.l2mu_cell.freeze_Win()
+    model.l2mu_cell._train_D = True
+
+    # ── PHASE 2: Train D only ─────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print("PHASE 2 — Train D only (W_in frozen)")
+    print(f"{'='*60}\n")
+
+    for epoch in range(PHASE2_EPOCHS):
+
+        total_spike_rate = 0.0
+        num_batches = 0
+
+        for data, _ in train_loader:
+            data = data.to(device).swapaxes(0, 1)
+            with torch.no_grad():
+                spk_y = model(data)
+            total_spike_rate += spk_y.mean().item()
+            num_batches += 1
+            model.l2mu_cell.stdp_update()
+
+        D_mean   = model.l2mu_cell.D.weight.mean().item()
+        D_std    = model.l2mu_cell.D.weight.std().item()
+        D_min    = model.l2mu_cell.D.weight.min().item()
+        D_max    = model.l2mu_cell.D.weight.max().item()
         avg_rate = total_spike_rate / num_batches
 
         print(
-            f"Epoch {epoch+1:3d}/{num_epochs} | "
+            f"[Phase2] Epoch {epoch+1:3d}/{PHASE2_EPOCHS} | "
             f"y spike rate: {avg_rate:.4f} | "
-            f"D weight — mean: {D_mean:.4f} | std: {D_std:.4f} | min: {D_min:.4f} | max: {D_max:.4f} | "
-            f"W_in weight — mean: {W_in_mean:.4f} | std: {W_in_std:.4f} | min: {W_in_min:.4f} | max: {W_in_max:.4f}"
+            f"D — mean: {D_mean:.4f} | std: {D_std:.4f} | min: {D_min:.4f} | max: {D_max:.4f}"
         )
         
 
@@ -121,12 +148,11 @@ if __name__ == '__main__':
         'beta_spk_m': 0.35,
         'threshold_spk_m': 0.4,
         'beta_spk_y': 0.3,
-        'threshold_spk_y': 2.0,  # higher threshold to control spike rate
+        'threshold_spk_y': 2.5,  # higher threshold to control spike rate
     }
 
     train_exp1(
         params=params,
-        num_epochs=150,
         data_dir="data/braille_full_splitted",
         split=2,
         save_dir="model_insights/results/exp1",
