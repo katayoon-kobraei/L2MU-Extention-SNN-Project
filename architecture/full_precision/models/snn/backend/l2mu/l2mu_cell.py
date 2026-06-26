@@ -60,7 +60,7 @@ class L2MUCell(LMUCore):
         self.init_parameters()
 
         self._train_Win = True   # W_in trains first
-        self._train_D   = False  # D frozen initially
+        self._train_D   = True  # D frozen initially
         
         # D trained by STDP only — excluded from any optimizer
         self.D.weight.requires_grad_(False)

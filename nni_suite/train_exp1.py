@@ -66,10 +66,9 @@ def train_exp1(params, PHASE1_EPOCHS=75, PHASE2_EPOCHS=75, data_dir="../data/bra
     print(f"{'='*60}\n")
 
     model.l2mu_cell._train_Win = True
-    model.l2mu_cell._train_D   = False
+    model.l2mu_cell._train_D   = True
 
-    for epoch in range(PHASE1_EPOCHS):
-
+    for epoch in range(150):
         total_spike_rate = 0.0
         num_batches = 0
 
@@ -81,14 +80,17 @@ def train_exp1(params, PHASE1_EPOCHS=75, PHASE2_EPOCHS=75, data_dir="../data/bra
             num_batches += 1
             model.l2mu_cell.stdp_update()
 
+        D_mean   = model.l2mu_cell.D.weight.mean().item()
+        D_std    = model.l2mu_cell.D.weight.std().item()
         W_in_mean = model.l2mu_cell.W_in.weight.mean().item()
         W_in_std  = model.l2mu_cell.W_in.weight.std().item()
-        avg_rate  = total_spike_rate / num_batches
+        avg_rate = total_spike_rate / num_batches
 
         print(
-            f"[Phase1] Epoch {epoch+1:3d}/{PHASE1_EPOCHS} | "
-            f"y spike rate: {avg_rate:.4f} | "
-            f"W_in — mean: {W_in_mean:.4f} | std: {W_in_std:.4f}"
+            f"Epoch {epoch+1:3d}/150 | "
+            f"y rate: {avg_rate:.4f} | "
+            f"D mean: {D_mean:.4f} std: {D_std:.4f} | "
+            f"W_in mean: {W_in_mean:.4f} std: {W_in_std:.4f}"
         )
 
     # freeze W_in, unfreeze D
