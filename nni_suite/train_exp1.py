@@ -57,13 +57,6 @@ def train_exp1(params, PHASE1_EPOCHS=75, PHASE2_EPOCHS=75, data_dir="../data/bra
     print(f"Initial W_in weight mean: {model.l2mu_cell.W_in.weight.mean().item():.4f}")
     print(f"Initial W_in weight std:  {model.l2mu_cell.W_in.weight.std().item():.4f}")
 
-    PHASE1_EPOCHS = 75  # train W_in only
-    PHASE2_EPOCHS = 75  # train D only
-
-    # ── PHASE 1: Train W_in only ──────────────────────────────────────
-    print(f"\n{'='*60}")
-    print("PHASE 1 — Train W_in only (D frozen)")
-    print(f"{'='*60}\n")
 
     model.l2mu_cell._train_Win = True
     model.l2mu_cell._train_D   = True
@@ -93,39 +86,6 @@ def train_exp1(params, PHASE1_EPOCHS=75, PHASE2_EPOCHS=75, data_dir="../data/bra
             f"W_in mean: {W_in_mean:.4f} std: {W_in_std:.4f}"
         )
 
-    # freeze W_in, unfreeze D
-    model.l2mu_cell.freeze_Win()
-    model.l2mu_cell._train_D = True
-
-    # ── PHASE 2: Train D only ─────────────────────────────────────────
-    print(f"\n{'='*60}")
-    print("PHASE 2 — Train D only (W_in frozen)")
-    print(f"{'='*60}\n")
-
-    for epoch in range(PHASE2_EPOCHS):
-
-        total_spike_rate = 0.0
-        num_batches = 0
-
-        for data, _ in train_loader:
-            data = data.to(device).swapaxes(0, 1)
-            with torch.no_grad():
-                spk_y = model(data)
-            total_spike_rate += spk_y.mean().item()
-            num_batches += 1
-            model.l2mu_cell.stdp_update()
-
-        D_mean   = model.l2mu_cell.D.weight.mean().item()
-        D_std    = model.l2mu_cell.D.weight.std().item()
-        D_min    = model.l2mu_cell.D.weight.min().item()
-        D_max    = model.l2mu_cell.D.weight.max().item()
-        avg_rate = total_spike_rate / num_batches
-
-        print(
-            f"[Phase2] Epoch {epoch+1:3d}/{PHASE2_EPOCHS} | "
-            f"y spike rate: {avg_rate:.4f} | "
-            f"D — mean: {D_mean:.4f} | std: {D_std:.4f} | min: {D_min:.4f} | max: {D_max:.4f}"
-        )
         
 
     # --- Save D weights ---
