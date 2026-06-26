@@ -5,19 +5,20 @@ from architecture.full_precision.models.snn.backend.l2mu.l2mu_cell import L2MUCe
 
 class L2MU(nn.Module):
     """
-    Experiment 2B model — full SSM with S2-STDP supervised output layer.
+    Experiment 2D model.
 
-    Populations:
-        m + y  : D frozen from Exp1
-        out    : 54 LIF neurons (2 per Braille class), W_out trained by S2-STDP
-                 Neuron 2*c   = target neuron for class c
-                 Neuron 2*c+1 = non-target neuron for class c
+    Runs the frozen backbone (m + y populations) across all T timesteps
+    inside torch.no_grad(), accumulates spike rates, then applies the
+    trainable W_out once — outside no_grad — so CE loss gradients reach
+    only W_out.weight and nothing else.
 
-    Classification at inference:
-        For each class c, the "vote" is the spike count of its target neuron
-        (index 2*c).  The predicted class is argmax over target neurons.
-        (Non-target neurons are used during training only to improve class
-        separation and are not used for the final prediction.)
+    This is the correct way to train only a linear readout on top of a
+    frozen spiking backbone without needing surrogate gradients at all:
+    the gradient of CE w.r.t. W_out.weight is simply spk_y_rate itself.
+
+    Forward returns:
+        logits      [B, 27]       — fed to cross_entropy loss
+        spk_y_stack [T, B, 250]   — for monitoring y rates during training
     """
 
     def __init__(self, input_size, params, neuron_type='Leaky'):
@@ -31,54 +32,39 @@ class L2MU(nn.Module):
 
     def forward(self, input_seq: torch.Tensor):
         """
-        Full T-step forward pass over a spike sequence.
-
         Args:
             input_seq : [T, B, input_size]
-
         Returns:
-            spk_out_stack : [T, B, 54]  — output spikes at each timestep
-            spk_y_stack   : [T, B, memory_size]
+            logits      : [B, 27]
+            spk_y_stack : [T, B, memory_size]
         """
+        T = input_seq.size(0)
         spk_memory = self.l2mu_cell.init_cell()
+        spk_y_list = []
 
-        spk_out_list = []
-        spk_y_list   = []
+        # ── Backbone: run all T steps, no gradients needed ────────────────
+        # D and W_in are frozen. We also block grads through the LIF states
+        # so backprop is clean and fast (no BPTT through 256 timesteps).
+        with torch.no_grad():
+            for step in range(T):
+                spk_y, spk_memory = self.l2mu_cell(
+                    input_seq[step].flatten(1), spk_memory)
+                spk_y_list.append(spk_y)
 
-        for step in range(input_seq.size(0)):
-            spk_out, spk_y, spk_memory = self.l2mu_cell(
-                input_seq[step].flatten(1),
-                spk_memory=spk_memory,
-            )
-            spk_out_list.append(spk_out)
-            spk_y_list.append(spk_y)
+        spk_y_stack = torch.stack(spk_y_list, dim=0)   # [T, B, 250]
 
-        return (
-            torch.stack(spk_out_list, dim=0),   # [T, B, 54]
-            torch.stack(spk_y_list,   dim=0),   # [T, B, memory_size]
-        )
+        # Spike rate: normalise by T so values are in [0, 1] regardless
+        # of sequence length — keeps W_out inputs well-scaled for Adam.
+        spk_y_rate  = spk_y_stack.mean(dim=0)           # [B, 250]
 
-    def predict(self, spk_out_stack: torch.Tensor) -> torch.Tensor:
-        """
-        Convert output spike stack to class predictions.
+        # ── Classifier: W_out applied OUTSIDE no_grad ─────────────────────
+        # spk_y_rate has requires_grad=False (computed inside no_grad).
+        # logits still has requires_grad=True because W_out.weight does.
+        # d(loss)/d(W_out.weight) = spk_y_rate.T @ d(loss)/d(logits)
+        logits = self.l2mu_cell.W_out(spk_y_rate)       # [B, 27]
 
-        Strategy: for each class c, use the total spike count of target
-        neuron 2*c over all timesteps.  Predicted class = argmax.
+        return logits, spk_y_stack
 
-        Args:
-            spk_out_stack : [T, B, 54]
-
-        Returns:
-            predictions : [B]  — integer class indices
-        """
-        # Sum spikes over time: [B, 54]
-        spike_counts = spk_out_stack.sum(dim=0)
-
-        # Extract only target neurons (indices 0, 2, 4, ..., 52)
-        target_indices = torch.arange(
-            0, L2MUCell.NUM_OUT, L2MUCell.NEURONS_PER_CLS,
-            device=spike_counts.device
-        )   # [27]
-        target_counts = spike_counts[:, target_indices]   # [B, 27]
-
-        return target_counts.argmax(dim=1)   # [B]
+    def predict(self, logits: torch.Tensor) -> torch.Tensor:
+        """Argmax of logits → predicted class index."""
+        return logits.argmax(dim=1)
