@@ -1,47 +1,39 @@
 import snntorch
 import torch
 from architecture.full_precision.core.lmu.interface import LMUCore
+from architecture.full_precision.core.lmu.utils import XavierLinear
 
 
 class L2MUCell(LMUCore):
     """
-    Experiment 1: SSM core with ONLY m and y populations.
-    No out population, no W_out, no classification.
+    Experiment 1 — Simultaneous W_in + D STDP with WTA (corrected run).
 
-    Goal: train D with unsupervised STDP so that the y population
-    learns to represent prototypical Braille letter patterns,
-    purely from spike correlations — no labels used at all.
+    Prof. Fra's instruction: train W_in with the same STDP strategy as D.
+    The previous simultaneous run failed because WTA was missing — all y
+    neurons converged to the same average response without competition.
+    WTA is the fix: only the winning y neuron's weights update per step,
+    forcing each neuron to specialize toward a different Braille pattern.
 
     Architecture:
-        m population: m[t+1] = A * m[t] + B * x[t]   (A, B fixed)
-        y population: y[t] = C * m[t] + D * x[t]   (C fixed, D STDP)
+        m population : m[t+1] = A*m[t] + B*W_in(x[t])   (W_in ← STDP + WTA)
+        y population : y[t]   = C*m[t] + D*x[t]           (D    ← STDP + WTA)
 
-    Fixes vs previous version:
-        1. Removed e_x — B now receives spk_input directly summed
-           to one scalar per memory slot, no random projection
-        2. STDP traces reset between EVERY sample (not just per batch)
-           following Diehl & Cook 2015 rest phase between samples
-        3. Weight-dependent STDP update — weights near W_MAX get
-           smaller potentiation, weights near W_MIN get smaller
-           depression — creates natural stabilization
+    Both W_in [24→250] and D [24→250] receive raw spk_input (24-dim).
+    WTA is applied to spk_y using curr_y (membrane potential) argmax —
+    not spk_y argmax, which would always pick the lowest-index active neuron.
     """
 
-    # D hyperparameters
+    # STDP hyperparameters for D
     STDP_A_PLUS_D   = 0.02
     STDP_A_MINUS_D  = 0.01
     STDP_TAU_PRE_D  = 0.95
     STDP_TAU_POST_D = 0.95
 
-    # W_in hyperparameters — different to break symmetry
+    # STDP hyperparameters for W_in — asymmetric to break symmetry
     STDP_A_PLUS_WIN   = 0.01
     STDP_A_MINUS_WIN  = 0.005
     STDP_TAU_PRE_WIN  = 0.80
     STDP_TAU_POST_WIN = 0.80
-
-    # STDP_A_PLUS = 0.005
-    # STDP_A_MINUS = 0.005
-    # STDP_TAU_PRE = 0.95
-    # STDP_TAU_POST = 0.95
 
     W_MAX = 1.0
     W_MIN = 0.0
@@ -53,207 +45,176 @@ class L2MUCell(LMUCore):
             memory_size=int(params['memory_size']),
             order=int(params['order']),
             theta=params['theta'],
-            output_size=1,        # dummy — not used in exp1
+            output_size=1,          # dummy — not used in Exp1
             trainable_theta=trainable_theta,
             discretizer=params.get('discretizer', 'zoh'),
         )
         self.init_parameters()
 
-        self._train_Win = True   # W_in trains first
-        self._train_D   = True  # D frozen initially
-        
-        # D trained by STDP only — excluded from any optimizer
-        self.D.weight.requires_grad_(False)
-        torch.nn.init.uniform_(self.D.weight, 0.0, 1.0)
-
-        # W_out not needed in Exp1
-        self.W_out.weight.requires_grad_(False)
-
-        # W_in trained by STDP — excluded from optimizer
-        self.W_in.weight.requires_grad_(False)
+        # ── W_in [24→250]: trained by STDP + WTA (same strategy as D) ───
+        self.W_in = XavierLinear(self.input_size, self.memory_size, bias=False)
         torch.nn.init.uniform_(self.W_in.weight, 0.0, 1.0)
+        self.W_in.weight.requires_grad_(False)   # updated by STDP, not optimizer
+
+        # ── D [24→250]: trained by STDP + WTA ────────────────────────────
+        self.D = XavierLinear(self.input_size, self.memory_size, bias=False)
+        torch.nn.init.uniform_(self.D.weight, 0.0, 1.0)
+        self.D.weight.requires_grad_(False)      # updated by STDP, not optimizer
+
+        # W_out: not used in Exp1
+        self.W_out.weight.requires_grad_(False)
 
         try:
             Neuron = getattr(snntorch, neuron_type)
         except AttributeError:
             raise ValueError(f"Neuron type '{neuron_type}' not found in snntorch.")
 
-        # m population
         self.spk_m = Neuron(
             beta=params['beta_spk_m'],
             threshold=params['threshold_spk_m'],
-            learn_beta=False,
-            learn_threshold=False,
-            init_hidden=True,
+            learn_beta=False, learn_threshold=False, init_hidden=True,
         )
-
-        # y population
         self.spk_y = Neuron(
             beta=params['beta_spk_y'],
             threshold=params['threshold_spk_y'],
-            learn_beta=False,
-            learn_threshold=False,
-            init_hidden=True,
+            learn_beta=False, learn_threshold=False, init_hidden=True,
         )
 
-        # STDP traces — reset per sample, not per batch
-        self.trace_pre_D = None
-        self.trace_post_D = None
-        self.trace_pre_Win = None   # pre = spk_input (raw 24-dim)
-        self.trace_post_Win = None   # post = spk_y (250-dim)
+        # STDP traces for both W_in and D
+        self.trace_pre_D    = None
+        self.trace_post_D   = None
+        self.trace_pre_Win  = None
+        self.trace_post_Win = None
 
-        # Spike history per timestep — saved during forward
-        self._spk_input_hist = []   # stores u_t (projected input for D)
-        self._spk_raw_hist = []   # stores raw spk_input (for W_in)
-        self._spk_y_hist = []
+        # Spike history accumulated per batch
+        self._spk_input_hist  = []   # raw spk_input — pre-synaptic for both
+        self._spk_y_wta_hist  = []   # WTA-masked spk_y — post-synaptic for both
 
+    # ── Lifecycle ─────────────────────────────────────────────────────────
 
     def init_cell(self):
-        """
-        Reset LIF states and STDP traces.
-        Called at the start of EACH sample — following Diehl & Cook
-        rest phase between samples where all variables decay to rest.
-        """
+        """Reset LIF states and STDP traces. Call at the start of each batch."""
         self.spk_m.init_leaky()
         self.spk_y.init_leaky()
-        self._reset_traces_and_history()
-        return torch.empty(0)   # spk_memory placeholder
-
-    def _reset_traces_and_history(self):
-        """Reset STDP traces and spike history — called between samples."""
-        self.trace_pre_D = None
-        self.trace_post_D = None
-        self.trace_pre_Win = None
+        self.trace_pre_D    = None
+        self.trace_post_D   = None
+        self.trace_pre_Win  = None
         self.trace_post_Win = None
-        self._spk_raw_hist = []
         self._spk_input_hist = []
-        self._spk_y_hist = []
+        self._spk_y_wta_hist = []
+        return torch.empty(0)
 
     def _init_traces(self, batch_size, device):
-        # trace_pre_D tracks the pre-synaptic activity of D.
-        # Since D now receives u_t = e_x(spk_input) instead of raw spk_input,
-        # the pre-synaptic dimension changes from input_size (24) to memory_size (250).
-        # The trace shape must match D's input dimension for the STDP einsum to work.
-        self.trace_pre_D = torch.zeros(batch_size, self.input_size, device=device)
-        self.trace_post_D = torch.zeros(batch_size, self.memory_size, device=device)
-        self.trace_pre_Win = torch.zeros(batch_size, self.input_size, device=device)
+        self.trace_pre_D    = torch.zeros(batch_size, self.input_size,  device=device)
+        self.trace_post_D   = torch.zeros(batch_size, self.memory_size, device=device)
+        self.trace_pre_Win  = torch.zeros(batch_size, self.input_size,  device=device)
         self.trace_post_Win = torch.zeros(batch_size, self.memory_size, device=device)
 
-    def freeze_Win(self):
-        """Freeze W_in — stop STDP updates for W_in."""
-        self._train_Win = False
-        print("W_in frozen")
+    # ── Forward ───────────────────────────────────────────────────────────
 
-    def unfreeze_Win(self):
-        """Unfreeze W_in — resume STDP updates for W_in."""
-        self._train_Win = True
-
-    def freeze_D(self):
-        """Freeze D — stop STDP updates for D."""
-        self._train_D = False
-        print("D frozen")
-
-    def unfreeze_D(self):
-        """Unfreeze D — resume STDP updates for D."""
-        self._train_D = True
-
-        
     def forward(self, spk_input: torch.Tensor, spk_memory: torch.Tensor):
         """
-        Forward pass — m and y populations only.
-        e_x applied once at input boundary, u_t shared between B and D.
+        One-timestep forward pass.
+
+        Returns:
+            spk_y      : [B, memory_size]  raw y spikes (pre-WTA, for monitoring)
+            spk_memory : [B, memory_size, order]
         """
-        batch_size = spk_input.shape[0]
-        device = spk_input.device
+        B, device = spk_input.shape[0], spk_input.device
 
         if spk_memory.numel() == 0:
             spk_memory = torch.zeros(
-                (batch_size, self.memory_size, self.order),
-                dtype=torch.float, device=device)
+                (B, self.memory_size, self.order), dtype=torch.float, device=device)
 
         if self.trace_pre_D is None:
-            self._init_traces(batch_size, device)
+            self._init_traces(B, device)
 
-        # e_x is applied ONCE at the input boundary, projecting x[t] from input_size (24)
-        # to memory_size (250). The result u_t is shared between both B and D paths.
-        # This replaces the previous mean pooling (which gave all m neurons the same scalar)
-        # with a fixed random projection that gives each neuron a different linear combination
-        # of the 24 input channels, enabling proper specialization in both populations.
+        # m population: W_in encodes raw input for state memory
+        u_t        = self.W_in(spk_input)             # [B, 250]
+        curr_m     = self.A(spk_memory) + self.B(u_t.unsqueeze(-1))
+        spk_memory = self.spk_m(curr_m)
 
-        u_t = self.W_in(spk_input)   # [B, memory_size]
+        # y population: D encodes raw input for learned representations
+        curr_y = self.C(spk_memory).squeeze(-1) + self.D(spk_input)
+        spk_y  = self.spk_y(curr_y)                   # [B, 250]
 
-        # temporary DEBUG
-        if not hasattr(self, '_debug_printed'):
-            self._debug_printed = True
-            print(f"u_t std across memory dim: {u_t.std(dim=1).mean().item():.6f}")
-            print(f"u_t mean: {u_t.mean().item():.4f}")
-            print(f"W_in row std (how different rows are): {self.W_in.weight.std(dim=1).mean().item():.6f}")
+        # ── WTA: only the most excited y neuron updates weights ───────────
+        # curr_y argmax (membrane potential) gives a clear winner.
+        # spk_y_wta is used as post-synaptic signal for BOTH W_in and D.
+        winner    = curr_y.argmax(dim=1, keepdim=True)   # [B, 1]
+        wta_mask  = torch.zeros_like(spk_y)
+        wta_mask.scatter_(1, winner, 1.0)
+        spk_y_wta = spk_y * wta_mask                     # [B, 250]
+        # ─────────────────────────────────────────────────────────────────
 
-        u_t_3d = u_t.unsqueeze(-1)               # [B, memory_size, 1]
-        curr_m = self.A(spk_memory) + self.B(u_t_3d)
-        spk_memory = self.spk_m(curr_m)                 # [B, memory_size, order]
+        # Save for STDP — same WTA signal used for both W_in and D
+        self._spk_input_hist.append(spk_input.detach())
+        self._spk_y_wta_hist.append(spk_y_wta.detach())
 
-        # y population: y[t] = C * m[t] + D * x[t]
-        curr_y = self.C(spk_memory).squeeze(-1) + self.D(spk_input)  # D gets u_t not spk_input
-        spk_y = self.spk_y(curr_y)                     # [B, memory_size]
-
-        # Save for STDP
-        self._spk_input_hist.append(spk_input.detach())  # save projected input
-        self._spk_raw_hist.append(spk_input.detach())
-        self._spk_y_hist.append(spk_y.detach())
-
+        # Return raw spk_y for monitoring
         return spk_y, spk_memory
+
+    # ── STDP update ───────────────────────────────────────────────────────
 
     def stdp_update(self):
         """
-        Apply weight-dependent unsupervised STDP to D.
-        Call this after processing each sample (not batch).
+        Weight-dependent STDP for both W_in and D, using WTA-masked
+        post-synaptic spikes.
 
-        Weight-dependent rule (Diehl & Cook 2015):
-            dW = A_plus  * (W_MAX - w) * trace_pre  * spk_post
+        Both matrices use the same WTA winner as post-synaptic signal.
+        This ensures both W_in and D neurons specialize together toward
+        the same distinct Braille patterns — as Prof. Fra requested.
+
+        Diehl & Cook weight-dependent rule:
+            dW = A_plus  * (W_MAX - w) * trace_pre  * spk_post_wta
                - A_minus * (w - W_MIN) * trace_post * spk_pre
-
-        Weights near W_MAX: potentiation is small → natural ceiling
-        Weights near W_MIN: depression is small  → natural floor
-        This creates stable diverse weight patterns.
         """
         if not self._spk_input_hist:
             return
 
         with torch.no_grad():
-            w_D = self.D.weight      # [memory_size, memory_size]
-            w_Win = self.W_in.weight   # [memory_size, input_size]    # [memory_size, memory_size] — D: u_t (250) → y (250)
+            w_D   = self.D.weight     # [250, 24]
+            w_Win = self.W_in.weight  # [250, 24]
 
-            for spk_raw, u_t, spk_y in zip(
-                self._spk_raw_hist,
+            for spk_input, spk_y_wta in zip(
                 self._spk_input_hist,
-                self._spk_y_hist,
+                self._spk_y_wta_hist,
             ):
-            
-                if self._train_Win:
-                        # W_in traces and update
-                    self.trace_pre_Win  = self.STDP_TAU_PRE_WIN  * self.trace_pre_Win  + spk_raw
-                    self.trace_post_Win = self.STDP_TAU_POST_WIN * self.trace_post_Win + spk_y
-                    dW_plus_Win  = self.STDP_A_PLUS_WIN  * torch.einsum('bi,bj->ij', spk_y, self.trace_pre_Win)  / spk_raw.shape[0]
-                    dW_minus_Win = self.STDP_A_MINUS_WIN * torch.einsum('bi,bj->ij', self.trace_post_Win, spk_raw) / spk_raw.shape[0]
-                    dW_Win = dW_plus_Win * (self.W_MAX - w_Win) - dW_minus_Win * (w_Win - self.W_MIN)
-                    self.W_in.weight.add_(dW_Win)
+                # ── W_in update ───────────────────────────────────────────
+                self.trace_pre_Win  = (
+                    self.STDP_TAU_PRE_WIN  * self.trace_pre_Win  + spk_input
+                )
+                self.trace_post_Win = (
+                    self.STDP_TAU_POST_WIN * self.trace_post_Win + spk_y_wta
+                )
+                dW_plus_Win  = self.STDP_A_PLUS_WIN * torch.einsum(
+                    'bi,bj->ij', spk_y_wta, self.trace_pre_Win
+                ) / spk_input.shape[0]
+                dW_minus_Win = self.STDP_A_MINUS_WIN * torch.einsum(
+                    'bi,bj->ij', self.trace_post_Win, spk_input
+                ) / spk_input.shape[0]
+                dW_Win = dW_plus_Win * (self.W_MAX - w_Win) - dW_minus_Win * (w_Win - self.W_MIN)
+                self.W_in.weight.add_(dW_Win)
 
-                if self._train_D:
-                    self.trace_pre_D  = self.STDP_TAU_PRE_D  * self.trace_pre_D  + u_t
-                    self.trace_post_D = self.STDP_TAU_POST_D * self.trace_post_D + spk_y
-                    dW_plus_D  = self.STDP_A_PLUS_D  * torch.einsum('bi,bj->ij', spk_y, self.trace_pre_D)  / u_t.shape[0]
-                    dW_minus_D = self.STDP_A_MINUS_D * torch.einsum('bi,bj->ij', self.trace_post_D, u_t)   / u_t.shape[0]
-                    dW_D = dW_plus_D * (self.W_MAX - w_D) - dW_minus_D * (w_D - self.W_MIN)
-                    self.D.weight.add_(dW_D)
+                # ── D update ──────────────────────────────────────────────
+                self.trace_pre_D  = (
+                    self.STDP_TAU_PRE_D  * self.trace_pre_D  + spk_input
+                )
+                self.trace_post_D = (
+                    self.STDP_TAU_POST_D * self.trace_post_D + spk_y_wta
+                )
+                dW_plus_D  = self.STDP_A_PLUS_D * torch.einsum(
+                    'bi,bj->ij', spk_y_wta, self.trace_pre_D
+                ) / spk_input.shape[0]
+                dW_minus_D = self.STDP_A_MINUS_D * torch.einsum(
+                    'bi,bj->ij', self.trace_post_D, spk_input
+                ) / spk_input.shape[0]
+                dW_D = dW_plus_D * (self.W_MAX - w_D) - dW_minus_D * (w_D - self.W_MIN)
+                self.D.weight.add_(dW_D)
 
-            if self._train_Win:
-                self.W_in.weight.clamp_(self.W_MIN, self.W_MAX)
-            if self._train_D:
-                self.D.weight.clamp_(self.W_MIN, self.W_MAX)
+            # Clip both to [W_MIN, W_MAX]
+            self.W_in.weight.clamp_(self.W_MIN, self.W_MAX)
+            self.D.weight.clamp_(self.W_MIN, self.W_MAX)
 
-            
-
-        self._spk_raw_hist = []
         self._spk_input_hist = []
-        self._spk_y_hist = []
+        self._spk_y_wta_hist = []
